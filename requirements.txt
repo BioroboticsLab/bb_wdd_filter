@@ -1,0 +1,12 @@
+joblib
+numpy
+pandas
+numba
+scikit-learn
+torch
+torchvision
+matplotlib
+pre-commit
+black
+madgrad
+imgaug
