@@ -1,3 +1,4 @@
+from locale import normalize
 import imgaug.augmenters as iaa
 import json
 import matplotlib.pyplot as plt
@@ -5,16 +6,24 @@ import numpy as np
 import os
 import pathlib
 import pickle
+import PIL
+import torchvision.transforms
 import zipfile
 
 
 class WDDDataset:
     def __init__(
-        self, paths, temporal_dimension=21, images_in_archives=True, remap_wdd_dir=None
+        self,
+        paths,
+        temporal_dimension=15,
+        n_targets=3,
+        target_offset=2,
+        images_in_archives=True,
+        remap_wdd_dir=None,
     ):
 
         self.images_in_archives = images_in_archives
-
+        self.sample_gaps = False
         self.all_meta_files = []
 
         # Count and index waggle information.
@@ -24,9 +33,13 @@ class WDDDataset:
                     self.all_meta_files = pickle.load(f)["json_files"]
             else:
                 paths = [paths]
-        if not self.all_meta_files:
-            for path in paths:
-                self.all_meta_files += list(pathlib.Path(path).glob("**/*.json"))
+
+        if isinstance(paths, list) and str(paths[0]).endswith(".json"):
+            self.all_meta_files += paths
+        else:
+            if not self.all_meta_files:
+                for path in paths:
+                    self.all_meta_files += list(pathlib.Path(path).glob("**/*.json"))
 
         print("Found {} waggle folders.".format(len(self.all_meta_files)))
 
@@ -37,20 +50,24 @@ class WDDDataset:
                 self.all_meta_files[i] = path
 
         self.temporal_dimension = temporal_dimension
+        self.n_targets = n_targets
+        self.target_offset = target_offset
 
-        self.default_crop = iaa.Sequential(iaa.CropToFixedSize(128, 128))
+        self.default_crop = iaa.Sequential(iaa.CenterCropToFixedSize(128, 128))
+
+        self.normalize_to_float = iaa.Sequential(
+            [
+                # Scale to range -1, +1
+                iaa.Multiply(2.0 / 255.0),
+                iaa.Add(-1.0),
+            ]
+        )
 
     @staticmethod
     def load_image(filename):
-        img = plt.imread(filename).astype(np.float32)
-        if img.max() > 1.0 + 1e-4:
-            img /= 255.0
-        if len(img.shape) > 2:
-            img = img[:, :, 0]
-
-        img *= 2.0
-        img -= 1.0
-
+        img = PIL.Image.open(filename)
+        img = np.asarray(img)
+        assert img.dtype is np.dtype(np.uint8)
         return img
 
     @staticmethod
@@ -62,7 +79,7 @@ class WDDDataset:
         images = []
         for fn in filenames:
             with archive.open(fn, "r") as f:
-                images.append(plt.imread(f))
+                images.append(WDDDataset.load_image(f))
         return images
 
     @staticmethod
@@ -71,6 +88,9 @@ class WDDDataset:
         temporal_dimension,
         load_images=True,
         images_in_archives=False,
+        gap_factor=1,
+        n_targets=0,
+        target_offset=1,
     ):
         waggle_dir = waggle_metadata_path.parent
 
@@ -80,24 +100,50 @@ class WDDDataset:
         available_frames_length = len(waggle_metadata["frame_timestamps"])
         try:
             waggle_angle = waggle_metadata["waggle_angle"]
+            assert np.abs(waggle_angle) < np.pi * 2.0
         except:
             waggle_angle = np.nan
 
-        sequence_length = 3 * temporal_dimension
-        sequence_start = np.random.randint(0, available_frames_length - sequence_length)
+        if temporal_dimension is not None:
+            target_sequence_length = n_targets * target_offset
+            sequence_length = int(
+                gap_factor * temporal_dimension + target_sequence_length
+            )
+            sequence_start = np.random.randint(
+                0, available_frames_length - sequence_length
+            )
+
+            assert available_frames_length >= target_sequence_length + sequence_length
 
         def select_images_from_list(images):
+
+            if temporal_dimension is None:
+                return images
+
             assert len(images) == available_frames_length
             images = images[sequence_start : (sequence_start + sequence_length)]
-            images = [
-                images[idx]
-                for idx in sorted(
-                    np.random.choice(
-                        sequence_length, size=temporal_dimension, replace=False
+
+            targets_start = sequence_length - target_sequence_length
+
+            if n_targets != 0:
+                targets = images[targets_start:][::target_offset]
+            else:
+                targets = []
+
+            if temporal_dimension == sequence_length - target_sequence_length:
+                images = images[:targets_start]
+            else:
+                images = [
+                    images[idx]
+                    for idx in sorted(
+                        np.random.choice(
+                            sequence_length - target_sequence_length,
+                            size=temporal_dimension,
+                            replace=False,
+                        )
                     )
-                )
-            ]
-            return images
+                ]
+            return images + targets
 
         if images_in_archives:
             zip_file_path = os.path.join(waggle_dir, "images.zip")
@@ -129,13 +175,15 @@ class WDDDataset:
     def __len__(self):
         return len(self.all_meta_files)
 
-    def __getitem__(self, i, aug=None, return_just_one=False):
+    def __getitem__(self, i, aug=None, return_just_one=False, normalize_to_float=False):
         waggle_metadata_path = self.all_meta_files[i]
 
         images, waggle_angle = WDDDataset.load_metadata_for_waggle(
             waggle_metadata_path,
             self.temporal_dimension,
             images_in_archives=self.images_in_archives,
+            n_targets=self.n_targets,
+            target_offset=self.target_offset,
         )
         if images is None:
             return self[i + 1]
@@ -147,10 +195,14 @@ class WDDDataset:
         else:
             images = self.default_crop.augment_images(images)
 
+        if normalize_to_float:
+            assert images[0].max() > 1
+            images = [img.astype(np.float32) for img in images]
+            images = self.normalize_to_float.augment_images(images)
+
         images = np.stack(images, axis=0)  # Stack over channels.
-        waggle_vector = np.zeros(shape=(2,))
+        waggle_vector = np.zeros(shape=(2,), dtype=np.float32)
         if np.isfinite(waggle_angle):
-            waggle_angle / 180 * np.pi
             waggle_vector[0] = np.cos(waggle_angle)
             waggle_vector[1] = np.sin(waggle_angle)
 
@@ -163,6 +215,34 @@ class BatchSampler:
         self.dataset = dataset
         self.total_length = len(dataset)
 
+        self.augmenters = None
+
+    def init_augmenters(self, current_epoch=1, total_epochs=1):
+
+        p = np.clip(
+            0.1 + np.log1p(2 * current_epoch / (max(1, total_epochs - 1))), 0, 1
+        )
+        p = 0.0
+
+        # These are applied to each image individually and must not rotate e.g. the images.
+        self.quality_augmenters = iaa.Sequential(
+            [
+                iaa.Sometimes(0.75 * p, iaa.GammaContrast((0.75, 1.25))),
+                iaa.Sometimes(0.5 * p, iaa.SaltAndPepper(0.05)),
+                iaa.Sometimes(0.75 * p, iaa.AdditiveGaussianNoise(scale=(0, 0.2))),
+                iaa.Sometimes(0.75 * p, iaa.GaussianBlur(sigma=(0.0, 1.5))),
+                iaa.Add(value=(-30, 30)),
+            ]
+        )
+        self.rescale = iaa.Sequential(
+            [
+                # Scale to range -1, +1
+                iaa.Multiply(2.0 / 255.0),
+                iaa.Add(-1.0),
+            ]
+        )
+
+        # These are sampled for each batch and applied to all images.
         self.augmenters = iaa.Sequential(
             [
                 iaa.Affine(
@@ -170,19 +250,43 @@ class BatchSampler:
                     rotate=(0, 360),
                     scale={"x": (0.9, 1.1), "y": (0.9, 1.1)},
                 ),
-                iaa.CropToFixedSize(128, 128)
-                # iaa.Sometimes(0.25, iaa.arithmetic.JpegCompression((0, 30))),
+                iaa.CropToFixedSize(128, 128, position="center"),
+                iaa.Sometimes(
+                    0.5 * p,
+                    iaa.Sequential(
+                        [
+                            iaa.Crop(
+                                percent=(0.1, 0.25),
+                                sample_independently=False,
+                                keep_size=False,
+                            ),
+                            iaa.PadToFixedSize(128, 128, position="center"),
+                        ]
+                    ),
+                ),
             ]
         )
+
+        # self.augmenters = iaa.Sequential([iaa.CropToFixedSize(128, 128, position="center")])
 
     def __len__(self):
         return self.total_length // self.batch_size
 
     def __getitem__(self, _):
+
+        if self.augmenters is None:
+            self.init_augmenters()
+
         aug = self.augmenters.to_deterministic()
 
-        def augment_fn(*args):
-            return BatchSampler.augment_sequence(aug, *args)
+        def augment_fn(images, *args):
+            nonlocal aug
+            images = self.quality_augmenters.augment_images(images)
+            images = self.rescale.augment_images(
+                [img.astype(np.float32) for img in images]
+            )
+            images, angles = BatchSampler.augment_sequence(aug, images, *args)
+            return images, angles
 
         samples, angles = [], []
 
@@ -198,8 +302,14 @@ class BatchSampler:
     def augment_sequence(self, aug, images, angle):
 
         random_state = aug.random_state.duplicate(12)[6]
-        rotation = aug[0].rotate.draw_sample(random_state=random_state.copy())
+        if len(aug) > 1:
+            rotation = aug[0].rotate.draw_sample(random_state=random_state.copy())
+            rotation = rotation / 180.0 * np.pi
+            assert np.abs(rotation) <= np.pi * 2.0
+        else:
+            rotation = 0.0
 
         for idx, img in enumerate(images):
             images[idx] = aug.augment_image(img)
+
         return images, angle + rotation

@@ -15,6 +15,7 @@ def calculate_cpc_loss(encodings, predictions, detach_accuracies=True):
     for i in range(n_timesteps):
         encoding = encodings[i]
         prediction = predictions[i]
+        prediction = torch.swapaxes(prediction, 0, 1)
 
         projections = torch.mm(encoding, prediction)
         assert projections.shape[0] == batch_size

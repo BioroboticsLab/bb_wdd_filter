@@ -14,12 +14,13 @@ class SubsampleBlock(torch.nn.Module):
         self.seq = torch.nn.Sequential(
             norm(
                 torch.nn.Conv2d(
-                    n_channels, n_mid_channels, kernel_size=3, padding=2, dilation=2
+                    n_channels, n_mid_channels, kernel_size=3, padding=1, dilation=1
                 )
             ),
+            torch.nn.GroupNorm(8, n_mid_channels),
             torch.nn.GLU(dim=1),
             torch.nn.Mish(),
-            torch.nn.BatchNorm2d(n_mid_channels // 2),
+            # torch.nn.BatchNorm2d(n_mid_channels // 2),
             norm(
                 torch.nn.Conv2d(
                     n_mid_channels // 2,
@@ -29,8 +30,9 @@ class SubsampleBlock(torch.nn.Module):
                     padding=1,
                 )
             ),
+            torch.nn.GroupNorm(8, n_out_channels),
             torch.nn.Mish(),
-            torch.nn.BatchNorm2d(n_out_channels),
+            # torch.nn.BatchNorm2d(n_out_channels),
         )
 
     def forward(self, x):
@@ -38,96 +40,133 @@ class SubsampleBlock(torch.nn.Module):
 
 
 class EmbeddingModel(torch.nn.Module):
-    def __init__(self, n_channels=1, temporal_length=20):
+    def __init__(self, n_channels=1, temporal_length=15, n_targets=3):
         super().__init__()
 
         self.temporal_length = temporal_length
+        self.n_targets = n_targets
 
         n_mid_channels = 64
         norm = torch.nn.utils.spectral_norm
 
-        embedding_size = 64
+        embedding_size = 256
         hidden_state_size = 64
         f = 2
         self.embedding = torch.nn.Sequential(
             # 128
-            SubsampleBlock(n_channels, 32, 64 // f),  # 64
-            SubsampleBlock(64 // f, 64 // f, 128 // f),  # 32
+            SubsampleBlock(n_channels, 32, 96 // 2 // f),  # 64
+            SubsampleBlock(96 // 2 // f, 128 // f, 128 // f),  # 32
             SubsampleBlock(128 // f, 128 // f, 256 // f),  # 16
             SubsampleBlock(256 // f, 256 // f, 512 // f),  # 8
-            SubsampleBlock(512 // f, 128, embedding_size),  # 4
-            torch.nn.AvgPool2d(4),
-            torch.nn.LeakyReLU(),
+            SubsampleBlock(512 // f, embedding_size, 2 * embedding_size),  # 4
+            norm(
+                torch.nn.Conv2d(
+                    2 * embedding_size,
+                    embedding_size,
+                    kernel_size=4,
+                )
+            ),
         )
 
         self.lstm = torch.nn.LSTM(
             input_size=embedding_size, hidden_size=hidden_state_size, batch_first=False
         )
 
-        self.predictor = torch.nn.Sequential(
-            torch.nn.Linear(hidden_state_size, hidden_state_size // 2),
-            torch.nn.Mish(),
-            torch.nn.BatchNorm1d(hidden_state_size // 2),
-            torch.nn.Linear(hidden_state_size // 2, embedding_size),
-            torch.nn.LeakyReLU(),
+        self.predictors = torch.nn.ModuleList(
+            [
+                torch.nn.Sequential(
+                    # torch.nn.Linear(hidden_state_size, hidden_state_size // 2),
+                    # torch.nn.GroupNorm(1, hidden_state_size // 2),
+                    # torch.nn.Mish(),
+                    torch.nn.Linear(hidden_state_size, embedding_size),
+                    # torch.nn.LeakyReLU(),
+                )
+                for _ in range(self.n_targets)
+            ]
         )
 
-        self.distance_metric = torch.nn.CosineSimilarity(dim=1)
+        self.direction_vector_regressor = torch.nn.Sequential(
+            torch.nn.Linear(hidden_state_size, hidden_state_size * 2),
+            torch.nn.GroupNorm(8, hidden_state_size * 2),
+            torch.nn.Mish(),
+            torch.nn.Linear(hidden_state_size * 2, 2),
+            torch.nn.Tanh(),
+        )
+
+        self.vector_similarity = torch.nn.CosineSimilarity(dim=1)
+
+    def predict_waggle_direction(self, hidden_state):
+        directions = self.direction_vector_regressor(hidden_state)
+        lengths = torch.linalg.vector_norm(directions, dim=1) + 1e-3
+        directions = directions / lengths.unsqueeze(1)
+        return directions
 
     def embed(self, images):
         return self.embedding(images)
 
-    def forward(self, images):
-        batch_size = images.shape[0]
-        assert images.shape[1] == self.temporal_length
+    def embed_sequence(self, images, return_full_state=False, check_length=True):
+
+        assert (
+            (not check_length)
+            or (self.temporal_length is None)
+            or (images.shape[1] == self.temporal_length)
+        )
+
+        temporal_length = self.temporal_length or images.shape[1]
+
         embeddings = []
-        for i in range(2):  # range(self.temporal_length):
+        for i in range(temporal_length):
             e = self.embed(images[:, i : (i + 1), :, :])
             embedding_size = e.shape[1]
             assert e.shape[2] == 1 and e.shape[3] == 1
             e = e[:, :, 0, 0]
-
             embeddings.append(e)
+
         embeddings = torch.stack(embeddings, dim=0)
-        # print(e.shape, hidden_states.shape if hidden_states is not None else None)
         lstm_state, hidden_states = self.lstm(embeddings)
-        lstm_state = lstm_state[-1]  # Last sequence state.
+        if not return_full_state:
+            lstm_state = lstm_state[-1]  # Last sequence state.
 
-        predictions = self.predictor(lstm_state)
+        return lstm_state
 
-        return predictions
+    def forward(self, images):
 
-    def run_batch(self, images):
+        sequential_embeddings = self.embed_sequence(images)
+        predictions = [
+            predictor(sequential_embeddings) for predictor in self.predictors
+        ]
+
+        return sequential_embeddings, predictions
+
+    def run_batch(self, images, vectors):
         batch_size, L = images.shape[:2]
-        base = images[:, :-1, :, :]
-        target = images[:, -1:, :, :]
+        base = images[:, : -len(self.predictors), :, :]
 
-        target_embedding = self.embed(target)
-        target_embedding = target_embedding[
-            :, :, 0, 0
-        ]  # Collapse dimensions of length 1.
-        # embedding_size = target_embedding.shape[1]
-        predictions = self(base)
-        predictions = torch.swapaxes(predictions, 0, 1)
+        assert base.shape[1] == self.temporal_length
 
-        losses = calculate_cpc_loss([target_embedding], [predictions])
+        target_embeddings = []
+        targets = images[:, -len(self.predictors) :, :, :]
+        for idx, predictor in enumerate(self.predictors):
 
-        """
-        positive_predictions = self.distance_metric(
-            predictions[:, 0], predictions[:, 1]
-        )
-        negative_predictions = self.distance_metric(
-            predictions[:-1, 0], predictions[1:, 0]
-        )
-        assert positive_predictions.shape[0] == batch_size
-        assert (
-            len(positive_predictions.shape) == 1 or positive_predictions.shape[1] == 1
-        )
+            target_embedding = self.embed(targets[:, idx : (idx + 1)])
+            target_embedding = target_embedding[
+                :, :, 0, 0
+            ]  # Collapse dimensions of length 1.
+            target_embeddings.append(target_embedding)
 
-        cpc_loss = torch.mean(negative_predictions) - torch.mean(positive_predictions)
-        cpc_loss = torch.exp(cpc_loss)
+        sequential_embeddings, predictions = self(base)
+        # losses = calculate_cpc_loss(target_embeddings, predictions)
+        losses = dict()
 
-        return {"cpc_loss": cpc_loss}
-        """
+        if vectors is not None:
+            valid_indices = ~torch.all(torch.abs(vectors) < 1e-4, dim=1)
+            if torch.any(valid_indices):
+                vectors_hat = self.predict_waggle_direction(
+                    sequential_embeddings[valid_indices]
+                )
+                divergence = 1.0 - self.vector_similarity(
+                    vectors[valid_indices], vectors_hat
+                )
+                losses["vector_mse"] = torch.mean(divergence)
 
         return losses

@@ -1,5 +1,7 @@
 import madgrad
 import numpy as np
+import pathlib
+import shutil
 import torch
 import tqdm.auto
 
@@ -15,11 +17,21 @@ class Trainer:
         batch_size=32,
         use_wandb=None,
         wandb_config=dict(),
-        save_path=None,
+        save_path="warn",
         save_every_n_batches=5000,
         num_workers=16,
         continue_training=True,
     ):
+        def init_worker(ID):
+
+            import torch
+            import numpy as np
+
+            np.random.seed(torch.initial_seed() % 2 ** 32)
+
+            import imgaug
+
+            imgaug.seed((torch.initial_seed() + 1) % 2 ** 32)
 
         self.dataset = dataset
         self.batch_sampler = BatchSampler(dataset, batch_size)
@@ -30,6 +42,7 @@ class Trainer:
             batch_sampler=None,
             pin_memory=True,
             shuffle=True,
+            worker_init_fn=init_worker,
         )
         self.model = model
 
@@ -48,8 +61,14 @@ class Trainer:
         else:
             self.id = None
 
+        if save_path == "warn":
+            print("Warning: No model save path given. Model will not be saved.")
+            save_path = None
+
         self.save_path = save_path
         self.save_every_n_batches = save_every_n_batches
+        self.total_batches = 0
+        self.total_epochs = 0
 
         self.continue_training = continue_training
 
@@ -62,8 +81,10 @@ class Trainer:
 
         self.model.train()
         images = images.cuda(non_blocking=True)
+        if vectors is not None:
+            vectors = vectors.cuda(non_blocking=True)
         self.optimizer.zero_grad()
-        losses = self.model.run_batch(images)
+        losses = self.model.run_batch(images, vectors)
 
         total_loss = None
         for loss_name, value in losses.items():
@@ -95,12 +116,30 @@ class Trainer:
                 config = wandb.config
                 config["optimizer"] = type(self.optimizer).__name__
 
-        for batch_idx, batch in enumerate(tqdm.auto.tqdm(self.dataloader, leave=False)):
+        n_batches = len(self.batch_sampler)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer, 0.0001, total_steps=n_batches
+        )
+
+        for _, batch in enumerate(tqdm.auto.tqdm(self.dataloader, leave=False)):
+
+            if self.total_batches % 100 == 0:
+                # Scale augmentation.
+                batches_to_reach_maximum_augmentation = 2000
+                self.batch_sampler.init_augmenters(
+                    current_epoch=self.total_batches,
+                    total_epochs=batches_to_reach_maximum_augmentation,
+                )
 
             loss_info = self.run_batch(*batch)
 
-            if batch_idx % self.save_every_n_batches == 0 and batch_idx > 0:
+            self.total_batches += 1
+
+            if (self.total_batches + 1) % (self.save_every_n_batches + 1) == 0:
                 if self.save_path is not None:
+                    tqdm.auto.tqdm.write(
+                        "Saving model state at batch {}..".format(self.total_batches)
+                    )
                     self.save_state()
 
                 if self.use_wandb:
@@ -110,22 +149,41 @@ class Trainer:
                     )
                     loss_info["embedding"] = wandb.Image(img)
 
+            scheduler.step()
+
             if self.use_wandb:
+                loss_info["learning_rate"] = scheduler._last_lr
                 wandb.log(loss_info)
 
     def run_epochs(self, n):
         for i in range(n):
-            self.run_epoch()
 
-    def save_state(self):
-        state = dict(model=self.model.state_dict(), wandb_id=self.id)
+            self.run_epoch()
+            self.total_epochs += 1
+
+            if self.save_path is not None:
+                print("Saving model state after epoch {}..".format(i), flush=True)
+                self.save_state(copy_suffix="_epoch{:03d}".format(self.total_epochs))
+
+    def save_state(self, copy_suffix=None):
+        state = dict(
+            model=self.model.state_dict(),
+            wandb_id=self.id,
+            total_batches=self.total_batches,
+            total_epochs=self.total_epochs,
+        )
         torch.save(state, self.save_path)
+
+        if copy_suffix:
+            ext = pathlib.Path(self.save_path).suffix
+            copy_path = self.save_path[: -len(ext)] + str(copy_suffix) + ext
+            shutil.copy(self.save_path, copy_path)
 
     def load_checkpoint(self):
         print("Loading last checkpoint...")
         state = torch.load(self.save_path)
-        if "wandb_id" in state:
-            self.id = state["wandb_id"]
-            self.model.load_state_dict(state["model"])
-        else:
-            self.model.load_state_dict(state)
+
+        self.id = state["wandb_id"]
+        self.total_batches = state["total_batches"]
+        self.total_epochs = state["total_epochs"]
+        self.model.load_state_dict(state["model"])

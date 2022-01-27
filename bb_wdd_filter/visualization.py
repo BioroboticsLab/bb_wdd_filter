@@ -29,7 +29,9 @@ def sample_embeddings(model, dataset, N=1000, test_batch_size=64, seed=42):
             for _ in range(test_batch_size):
                 idx = random_samples.pop()
                 all_indices.append(idx)
-                images, _ = dataset.__getitem__(idx, return_just_one=True)
+                images, _ = dataset.__getitem__(
+                    idx, return_just_one=True, normalize_to_float=True
+                )
                 batch_images.append(images)
             batch_images = np.stack(batch_images, axis=0)
             batch_images = torch.from_numpy(batch_images).cuda()
@@ -43,9 +45,7 @@ def sample_embeddings(model, dataset, N=1000, test_batch_size=64, seed=42):
 
 def plot_embeddings(embeddings, indices, dataset, scatterplot=False, display=True):
     embeddings = sklearn.decomposition.PCA(10).fit_transform(embeddings)
-    embeddings = sklearn.manifold.TSNE(
-        2, learning_rate="auto", init="pca"
-    ).fit_transform(embeddings)
+    embeddings = sklearn.manifold.TSNE(2, init="pca").fit_transform(embeddings)
 
     from PIL import Image
 
@@ -60,7 +60,8 @@ def plot_embeddings(embeddings, indices, dataset, scatterplot=False, display=Tru
         embedding_image = Image.new("RGBA", (W, H))
         for (x, y), img_idx in zip(embeddings, indices):
             small = dataset.__getitem__(img_idx, return_just_one=True)[0][0]
-            small = Image.fromarray((255.0 * (small + 1.0) / 2.0).astype(np.uint8))
+            small = np.clip(small, 0, 255)
+            small = Image.fromarray(small.astype(np.uint8))
             small.resize((64, 64))
             embedding_image.paste(
                 small, (int((x - min_x) * scale_x), int((y - min_y) * scale_y))
