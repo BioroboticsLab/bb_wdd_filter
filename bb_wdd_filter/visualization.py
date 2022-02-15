@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import matplotlib.cm
 import numpy as np
 import sklearn.decomposition
 import sklearn.manifold
@@ -43,11 +44,32 @@ def sample_embeddings(model, dataset, N=1000, test_batch_size=64, seed=42):
     return embeddings, all_indices
 
 
-def plot_embeddings(embeddings, indices, dataset, scatterplot=False, display=True):
-    embeddings = sklearn.decomposition.PCA(10).fit_transform(embeddings)
-    embeddings = sklearn.manifold.TSNE(2, init="pca").fit_transform(embeddings)
+def plot_embeddings(
+    embeddings,
+    indices,
+    dataset,
+    images=None,
+    labels=None,
+    scatterplot=False,
+    display=True,
+):
+    embeddings = sklearn.decomposition.PCA(16).fit_transform(embeddings)
+    embeddings = sklearn.manifold.TSNE(2, init="pca", perplexity=50).fit_transform(
+        embeddings
+    )
 
-    from PIL import Image
+    label_colormap = dict()
+    if labels is not None:
+        unique_labels = np.unique(labels)
+        for idx, label in enumerate(unique_labels):
+            color = 255.0 * np.array(
+                matplotlib.cm.tab10(idx / (len(unique_labels) + 1))
+            )
+            # Convert to PIL color string..
+            color = "rgb({:d}, {:d},{:d})".format(*list(map(int, color)))
+            label_colormap[label] = color
+
+    from PIL import Image, ImageOps
 
     min_x, max_x = embeddings[:, 0].min(), embeddings[:, 0].max()
     min_y, max_y = embeddings[:, 1].min(), embeddings[:, 1].max()
@@ -58,11 +80,21 @@ def plot_embeddings(embeddings, indices, dataset, scatterplot=False, display=Tru
     fig, ax = plt.subplots(figsize=(10, 10))
     if not scatterplot:
         embedding_image = Image.new("RGBA", (W, H))
-        for (x, y), img_idx in zip(embeddings, indices):
-            small = dataset.__getitem__(img_idx, return_just_one=True)[0][0]
+        for idx, ((x, y), img_idx) in enumerate(zip(embeddings, indices)):
+            if images is not None:
+                small = (images[idx] + 1.0) * (255.0 / 2.0)
+            else:
+                small = dataset.__getitem__(img_idx, return_just_one=True)[0][0]
             small = np.clip(small, 0, 255)
+
             small = Image.fromarray(small.astype(np.uint8))
-            small.resize((64, 64))
+            small = small.resize((128, 128))
+            small = small.convert("RGBA")
+
+            if labels is not None:
+                small = ImageOps.expand(
+                    small, border=8, fill=label_colormap[labels[img_idx]]
+                )
             embedding_image.paste(
                 small, (int((x - min_x) * scale_x), int((y - min_y) * scale_y))
             )

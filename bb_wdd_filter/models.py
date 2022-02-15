@@ -2,13 +2,18 @@ import numpy as np
 import torch
 import torch.nn
 import torch.utils
+import torchvision.transforms.functional
 
 from .loss import calculate_cpc_loss
 
 
 class SubsampleBlock(torch.nn.Module):
-    def __init__(self, n_channels, n_mid_channels=64, n_out_channels=64):
+    def __init__(
+        self, n_channels, n_mid_channels=64, n_out_channels=64, subsample=True
+    ):
         super().__init__()
+
+        stride = 1 if not subsample else 2
 
         norm = torch.nn.utils.spectral_norm
         self.seq = torch.nn.Sequential(
@@ -26,7 +31,7 @@ class SubsampleBlock(torch.nn.Module):
                     n_mid_channels // 2,
                     n_out_channels,
                     kernel_size=3,
-                    stride=2,
+                    stride=stride,
                     padding=1,
                 )
             ),
@@ -40,7 +45,7 @@ class SubsampleBlock(torch.nn.Module):
 
 
 class EmbeddingModel(torch.nn.Module):
-    def __init__(self, n_channels=1, temporal_length=15, n_targets=3):
+    def __init__(self, n_channels=1, temporal_length=15, n_targets=3, image_size=128):
         super().__init__()
 
         self.temporal_length = temporal_length
@@ -54,9 +59,15 @@ class EmbeddingModel(torch.nn.Module):
         f = 2
         self.embedding = torch.nn.Sequential(
             # 128
-            SubsampleBlock(n_channels, 32, 96 // 2 // f),  # 64
-            SubsampleBlock(96 // 2 // f, 128 // f, 128 // f),  # 32
-            SubsampleBlock(128 // f, 128 // f, 256 // f),  # 16
+            SubsampleBlock(
+                n_channels, 32, 96 // 2 // f, subsample=image_size >= 128
+            ),  # 64
+            SubsampleBlock(
+                96 // 2 // f, 128 // f, 128 // f, subsample=image_size >= 64
+            ),  # 32
+            SubsampleBlock(
+                128 // f, 128 // f, 256 // f, subsample=image_size >= 32
+            ),  # 16
             SubsampleBlock(256 // f, 256 // f, 512 // f),  # 8
             SubsampleBlock(512 // f, embedding_size, 2 * embedding_size),  # 4
             norm(
@@ -102,15 +113,13 @@ class EmbeddingModel(torch.nn.Module):
         return directions
 
     def embed(self, images):
-        return self.embedding(images)
+        if self.training:
+            embedding = torch.utils.checkpoint.checkpoint(self.embedding, images)
+        else:
+            embedding = self.embedding(images)
+        return embedding
 
-    def embed_sequence(self, images, return_full_state=False, check_length=True):
-
-        assert (
-            (not check_length)
-            or (self.temporal_length is None)
-            or (images.shape[1] == self.temporal_length)
-        )
+    def calculate_image_embeddings_for_image_sequences(self, images):
 
         temporal_length = self.temporal_length or images.shape[1]
 
@@ -123,20 +132,33 @@ class EmbeddingModel(torch.nn.Module):
             embeddings.append(e)
 
         embeddings = torch.stack(embeddings, dim=0)
+
+        return embeddings
+
+    def embed_sequence(self, images, return_full_state=False, check_length=True):
+
+        assert (
+            (not check_length)
+            or (self.temporal_length is None)
+            or (images.shape[1] == self.temporal_length)
+        )
+
+        embeddings = self.calculate_image_embeddings_for_image_sequences(images)
+
         lstm_state, hidden_states = self.lstm(embeddings)
         if not return_full_state:
             lstm_state = lstm_state[-1]  # Last sequence state.
 
-        return lstm_state
+        return embeddings, lstm_state
 
     def forward(self, images):
 
-        sequential_embeddings = self.embed_sequence(images)
+        image_embeddings, sequential_embeddings = self.embed_sequence(images)
         predictions = [
             predictor(sequential_embeddings) for predictor in self.predictors
         ]
 
-        return sequential_embeddings, predictions
+        return image_embeddings, sequential_embeddings, predictions
 
     def run_batch(self, images, vectors):
         batch_size, L = images.shape[:2]
@@ -154,9 +176,26 @@ class EmbeddingModel(torch.nn.Module):
             ]  # Collapse dimensions of length 1.
             target_embeddings.append(target_embedding)
 
-        sequential_embeddings, predictions = self(base)
-        # losses = calculate_cpc_loss(target_embeddings, predictions)
-        losses = dict()
+        image_embeddings, sequential_embeddings, predictions = self(base)
+        losses = calculate_cpc_loss(target_embeddings, predictions)
+
+        # Add rotation invariance losses.
+        angles = np.arange(0, 360 - 45, 15) / 180 * np.pi
+        angles = np.random.choice(angles, 2, replace=False)
+
+        n_angles = angles.shape[0]
+        rotation_loss = 0.0
+
+        for angle in angles:
+            rotated = torchvision.transforms.functional.rotate(images, angle=angle)
+            rotated_embeddings = self.calculate_image_embeddings_for_image_sequences(
+                rotated
+            )
+
+            difference = torch.abs(image_embeddings - rotated_embeddings).mean()
+            rotation_loss += difference
+
+        losses["rotation_inv_loss"] = rotation_loss / n_angles
 
         if vectors is not None:
             valid_indices = ~torch.all(torch.abs(vectors) < 1e-4, dim=1)
@@ -167,6 +206,6 @@ class EmbeddingModel(torch.nn.Module):
                 divergence = 1.0 - self.vector_similarity(
                     vectors[valid_indices], vectors_hat
                 )
-                losses["vector_mse"] = torch.mean(divergence)
+                losses["vector_loss"] = torch.mean(divergence)
 
         return losses

@@ -1,5 +1,6 @@
 import madgrad
 import numpy as np
+import pandas
 import pathlib
 import shutil
 import torch
@@ -18,9 +19,12 @@ class Trainer:
         use_wandb=None,
         wandb_config=dict(),
         save_path="warn",
-        save_every_n_batches=5000,
+        save_every_n_batches=None,
+        save_every_n_samples=25000,
         num_workers=16,
         continue_training=True,
+        image_size=128,
+        test_set_evaluator=None,
     ):
         def init_worker(ID):
 
@@ -34,7 +38,7 @@ class Trainer:
             imgaug.seed((torch.initial_seed() + 1) % 2 ** 32)
 
         self.dataset = dataset
-        self.batch_sampler = BatchSampler(dataset, batch_size)
+        self.batch_sampler = BatchSampler(dataset, batch_size, image_size=image_size)
         self.dataloader = torch.utils.data.DataLoader(
             self.batch_sampler,
             num_workers=num_workers,
@@ -65,8 +69,11 @@ class Trainer:
             print("Warning: No model save path given. Model will not be saved.")
             save_path = None
 
+        if save_every_n_batches is None:
+            save_every_n_batches = save_every_n_samples // batch_size
         self.save_path = save_path
         self.save_every_n_batches = save_every_n_batches
+        self.test_set_evaluator = test_set_evaluator
         self.total_batches = 0
         self.total_epochs = 0
 
@@ -81,8 +88,11 @@ class Trainer:
 
         self.model.train()
         images = images.cuda(non_blocking=True)
-        if vectors is not None:
+        if vectors is not None and not np.any(pandas.isnull(vectors)):
             vectors = vectors.cuda(non_blocking=True)
+        else:
+            vectors = None
+
         self.optimizer.zero_grad()
         losses = self.model.run_batch(images, vectors)
 
@@ -118,7 +128,7 @@ class Trainer:
 
         n_batches = len(self.batch_sampler)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer, 0.0001, total_steps=n_batches
+            self.optimizer, 0.001, total_steps=n_batches
         )
 
         for _, batch in enumerate(tqdm.auto.tqdm(self.dataloader, leave=False)):
@@ -143,11 +153,23 @@ class Trainer:
                     self.save_state()
 
                 if self.use_wandb:
-                    e, idx = sample_embeddings(self.model, self.dataset)
-                    img = plot_embeddings(
-                        e, idx, self.dataset, scatterplot=False, display=False
-                    )
-                    loss_info["embedding"] = wandb.Image(img)
+                    self.model.eval()
+
+                    if self.test_set_evaluator is not None:
+                        scores, plot = self.test_set_evaluator.evaluate(
+                            self.model, plot_kwargs=dict(display=False)
+                        )
+                        loss_info = {**loss_info, **scores}
+                        loss_info["embedding"] = wandb.Image(plot)
+
+                    else:
+                        e, idx = sample_embeddings(self.model, self.dataset)
+                        img = plot_embeddings(
+                            e, idx, self.dataset, scatterplot=False, display=False
+                        )
+                        loss_info["embedding"] = wandb.Image(img)
+
+                    self.model.train()
 
             scheduler.step()
 
