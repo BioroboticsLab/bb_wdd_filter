@@ -96,13 +96,10 @@ class Trainer:
         self.optimizer.zero_grad()
         losses = self.model.run_batch(images, vectors)
 
-        total_loss = None
+        total_loss = 0.0
         for loss_name, value in losses.items():
             if value.requires_grad:
-                if total_loss is None:
-                    total_loss = value
-                else:
-                    total_loss += value
+                total_loss += value
 
             current_state[loss_name] = float(value.detach().cpu().numpy())
         total_loss.backward()
