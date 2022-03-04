@@ -79,9 +79,54 @@ class EmbeddingModel(torch.nn.Module):
             ),
         )
 
-        self.lstm = torch.nn.LSTM(
-            input_size=embedding_size, hidden_size=hidden_state_size, batch_first=False
-        )
+        # Input size: b, embedding_size,  temporal_length
+        if False:
+            self.lstm = None
+            self.sequential_embedding = []
+            current_length = self.temporal_length
+            current_hidden_size = embedding_size
+            while current_length >= 4:
+                self.sequential_embedding += [
+                    torch.nn.Conv1d(
+                        current_hidden_size,
+                        current_hidden_size * 2,
+                        kernel_size=3,
+                        stride=1,
+                    ),
+                    torch.nn.GroupNorm(8, current_hidden_size * 2),
+                    torch.nn.Mish(),
+                ]
+                current_length -= 2
+                current_length //= 2
+
+                out_size = (
+                    current_hidden_size * 2
+                    if current_length >= 4
+                    else hidden_state_size
+                )
+                self.sequential_embedding += [
+                    torch.nn.Conv1d(
+                        current_hidden_size * 2,
+                        out_size,
+                        kernel_size=3,
+                        stride=2,
+                        padding=1,
+                    ),
+                    torch.nn.GroupNorm(8, out_size),
+                    torch.nn.Mish(),
+                ]
+
+                current_hidden_size = out_size
+
+            print(current_length)
+            self.sequential_embedding += [torch.nn.AvgPool1d(current_length)]
+            self.sequential_embedding = torch.nn.Sequential(*self.sequential_embedding)
+        else:
+            self.lstm = torch.nn.LSTM(
+                input_size=embedding_size,
+                hidden_size=hidden_state_size,
+                batch_first=False,
+            )
 
         self.predictors = torch.nn.ModuleList(
             [
@@ -145,11 +190,22 @@ class EmbeddingModel(torch.nn.Module):
 
         embeddings = self.calculate_image_embeddings_for_image_sequences(images)
 
-        lstm_state, hidden_states = self.lstm(embeddings)
-        if not return_full_state:
-            lstm_state = lstm_state[-1]  # Last sequence state.
+        if self.lstm is not None:
+            out, hidden_states = self.lstm(embeddings)
 
-        return embeddings, lstm_state
+            if not return_full_state:
+                out = out[-1]  # Last sequence state.
+
+        else:
+            e = torch.transpose(embeddings, 0, 1)
+            e = torch.transpose(e, 1, 2)
+
+            out = self.sequential_embedding(e)
+
+            if not return_full_state:
+                out = out[:, :, -1]
+
+        return embeddings, out
 
     def forward(self, images):
 
@@ -192,10 +248,13 @@ class EmbeddingModel(torch.nn.Module):
                 rotated
             )
 
-            difference = torch.abs(image_embeddings - rotated_embeddings).mean()
-            rotation_loss += difference
+            difference = 1.0 - self.vector_similarity(
+                image_embeddings, rotated_embeddings
+            )
+            # difference = torch.abs(image_embeddings - rotated_embeddings).mean()
+            rotation_loss += difference.mean()
 
-        losses["rotation_inv_loss"] = rotation_loss / n_angles
+        losses["rotation_inv_loss"] = 100 * rotation_loss / n_angles
 
         if vectors is not None:
             valid_indices = ~torch.all(torch.abs(vectors) < 1e-4, dim=1)
