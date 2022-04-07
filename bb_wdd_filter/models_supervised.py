@@ -1,0 +1,238 @@
+import numpy as np
+import sklearn.metrics
+import torch
+import torch.nn
+import torch.utils
+import torchvision.transforms.functional
+
+
+class WDDClassificationModel(torch.nn.Module):
+    def __init__(self, n_outputs=7, image_size=32, scaledown_factor=4):
+
+        super().__init__()
+
+        center_stride = image_size // 32
+        center_padding = 2 if image_size == 32 else 0
+
+        s = scaledown_factor
+
+        self.seq = [
+            # 60 x 32 - 60 x 64
+            torch.nn.Conv3d(1, 256 // s, kernel_size=5, stride=1, padding=0),
+            torch.nn.BatchNorm3d(256 // s),
+            torch.nn.Mish(inplace=True),
+            # 56 x 28 - 56 x 60
+            torch.nn.Conv3d(
+                256 // s, 64 // s, kernel_size=3, stride=1, padding=0, dilation=2
+            ),
+            torch.nn.BatchNorm3d(64 // s),
+            torch.nn.Mish(inplace=True),
+            # 52 x 24 - 52 x 56
+            torch.nn.Conv3d(
+                64 // s,
+                64 // s,
+                kernel_size=(5, 3, 3),
+                stride=2,
+                padding=(3, 1, 1),
+                dilation=(2, 1, 1),
+            ),
+            torch.nn.BatchNorm3d(64 // s),
+            torch.nn.Mish(inplace=True),
+            # 25 x 12 - 25 x 28
+            torch.nn.Conv3d(
+                64 // s,
+                64 // s,
+                kernel_size=5,
+                stride=(1, center_stride, center_stride),
+                padding=(2, center_padding, center_padding),
+                dilation=1,
+            ),
+            torch.nn.BatchNorm3d(64 // s),
+            torch.nn.Mish(inplace=True),
+            # 25 x 12 - 25 x 12
+            torch.nn.Conv3d(
+                64 // s,
+                128 // s,
+                kernel_size=3,
+                stride=2,
+                padding=(0, 1, 1),
+                dilation=1,
+            ),
+            torch.nn.BatchNorm3d(128 // s),
+            torch.nn.FeatureAlphaDropout(),
+            torch.nn.Mish(inplace=True),
+            # 12 x 6 - 12 x 6
+            torch.nn.Conv3d(
+                128 // s,
+                128 // s,
+                kernel_size=3,
+                stride=(2, 1, 1),
+                padding=(0, 1, 1),
+                dilation=(1, 2, 2),
+            ),
+            torch.nn.BatchNorm3d(128 // s),
+            torch.nn.GLU(dim=1),
+            torch.nn.Mish(inplace=True),
+            # 5 x 4 - 5 x 4
+            torch.nn.Conv3d(64 // s, n_outputs, kernel_size=(5, 4, 4)),
+        ]
+
+        self.seq = torch.nn.Sequential(*self.seq)
+
+    def forward(self, images):
+        if self.training:
+            images.requires_grad = True
+            output = torch.utils.checkpoint.checkpoint_sequential(self.seq, 4, images)
+        else:
+            output = self.seq(images)
+
+        if self.training:
+            shape_correct = (
+                output.shape[2] == 1 and output.shape[3] == 1 and output.shape[4] == 1
+            )
+            if not shape_correct:
+                raise ValueError(
+                    "Incorrect output shape: {} [input shape was {}]".format(
+                        output.shape, images.shape
+                    )
+                )
+            output = output[:, :, 0, 0, 0]
+
+        return output
+
+    def load_state_dict(self, d):
+        try:
+            return super().load_state_dict(d)
+        except:
+            print("Failed to load. Trying without DataParallel prefix.")
+            # Strip off Wrapper & DataParallel prefix.
+            d = {key.replace("model.module.", ""): v for key, v in d.items()}
+            return super().load_state_dict(d)
+
+
+# To support DataParallel.
+class SupervisedModelTrainWrapper(torch.nn.Module):
+    def __init__(
+        self, model, class_labels=["other", "waggle", "ventilating", "activating"]
+    ):
+
+        super().__init__()
+
+        self.vector_similarity = torch.nn.CosineSimilarity(dim=1)
+        self.mse = torch.nn.MSELoss()
+        self.classification_loss = torch.nn.CrossEntropyLoss()
+        self.class_labels = class_labels
+
+        self.model = model
+
+    def forward(self, x):
+        return self.model(x)
+
+    def calc_additional_metrics(
+        self, predictions, labels, vectors_hat, vectors, durations_hat, durations
+    ):
+
+        import wandb
+
+        results = dict()
+
+        predictions = torch.nn.functional.softmax(predictions, dim=1)
+
+        predictions = predictions.detach().cpu().numpy()
+        predicted_labels = np.argmax(predictions, axis=1)
+
+        labels = labels.detach().cpu().numpy()
+
+        results["train_conf"] = wandb.plot.confusion_matrix(
+            probs=None,
+            y_true=labels,
+            preds=predicted_labels,
+            class_names=self.class_labels,
+        )
+
+        try:
+            results["train_roc_auc"] = sklearn.metrics.roc_auc_score(
+                labels,
+                predictions,
+                multi_class="ovr",
+                labels=np.arange(len(self.class_labels)),
+            )
+        except:
+            pass
+
+        results["train_matthews"] = sklearn.metrics.matthews_corrcoef(
+            labels, predicted_labels
+        )
+
+        results["train_balanced_accuracy"] = sklearn.metrics.balanced_accuracy_score(
+            labels, predicted_labels, adjusted=True
+        )
+
+        results["train_f1_weighted"] = sklearn.metrics.f1_score(
+            labels, predicted_labels, average="weighted"
+        )
+
+        if vectors_hat is not None:
+            divergence = self.vector_similarity(vectors_hat, vectors)
+            results["vector_cossim"] = torch.mean(divergence)
+
+            vectors_hat = torch.tanh(vectors_hat)
+            divergence = self.mse(vectors_hat, vectors)
+            results["vector_mse"] = torch.mean(divergence)
+
+        return results
+
+    def run_batch(self, images, vectors, durations, labels):
+        batch_size, temp_dimension = images.shape[:2]
+        model = self.model
+
+        all_outputs = model(images)
+        n_classes = 4
+        n_targets = n_classes + 2
+
+        classes_hat = all_outputs[:, :n_classes]
+        vectors_hat = all_outputs[:, n_classes : (n_classes + 2)]
+        durations_hat = all_outputs[:, (n_classes + 2) : (n_classes + 3)]
+
+        losses = dict()
+
+        losses["classification_loss"] = self.classification_loss(classes_hat, labels)
+        # losses["classification_loss"] = self.mse(classes_hat, labels)
+
+        if vectors is not None:
+            other_target = 0
+            valid_indices = labels != other_target
+
+            if torch.any(valid_indices):
+                vectors_hat = vectors_hat[valid_indices]
+                vectors = vectors[valid_indices]
+
+                vectors_hat = torch.tanh(vectors_hat)
+                # divergence = 1.0 - self.vector_similarity(vectors, vectors_hat)
+                divergence = self.mse(vectors, vectors_hat)
+                losses["vector_loss"] = 1.5 * torch.mean(divergence)
+            else:
+                vectors_hat = None
+                vectors = None
+
+        if durations is not None:
+            waggle_target = 1
+            valid_indices = (labels == waggle_target) & (~torch.isnan(durations))
+
+            if torch.any(valid_indices):
+                durations_hat = durations_hat[valid_indices]
+                durations = durations[valid_indices]
+
+                durations_hat = torch.relu(durations_hat)
+                divergence = self.mse(durations, durations_hat)
+                losses["duration_loss"] = 1.0 * torch.mean(divergence)
+            else:
+                durations_hat = None
+                durations = None
+
+        with torch.no_grad():
+            losses["additional"] = self.calc_additional_metrics(
+                classes_hat, labels, vectors_hat, vectors, durations_hat, durations
+            )
+
+        return losses

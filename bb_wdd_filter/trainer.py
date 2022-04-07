@@ -21,10 +21,15 @@ class Trainer:
         save_path="warn",
         save_every_n_batches=None,
         save_every_n_samples=25000,
+        eval_test_set_every_n_samples=None,
         num_workers=16,
         continue_training=True,
         image_size=128,
         test_set_evaluator=None,
+        batch_sampler_kwargs=dict(),
+        max_lr=0.001,
+        batches_to_reach_maximum_augmentation=2000,
+        run_batch_fn=None,
     ):
         def init_worker(ID):
 
@@ -38,7 +43,9 @@ class Trainer:
             imgaug.seed((torch.initial_seed() + 1) % 2 ** 32)
 
         self.dataset = dataset
-        self.batch_sampler = BatchSampler(dataset, batch_size, image_size=image_size)
+        self.batch_sampler = BatchSampler(
+            dataset, batch_size, image_size=image_size, **batch_sampler_kwargs
+        )
         self.dataloader = torch.utils.data.DataLoader(
             self.batch_sampler,
             num_workers=num_workers,
@@ -51,6 +58,11 @@ class Trainer:
         self.model = model
 
         self.optimizer = madgrad.MADGRAD(self.model.parameters(), lr=0.001)
+        self.max_lr = max_lr
+        self.batches_to_reach_maximum_augmentation = (
+            batches_to_reach_maximum_augmentation
+        )
+        self.run_batch_fn = run_batch_fn
 
         self.use_wandb = use_wandb
         self.wandb_config = wandb_config
@@ -71,6 +83,13 @@ class Trainer:
 
         if save_every_n_batches is None:
             save_every_n_batches = save_every_n_samples // batch_size
+        if eval_test_set_every_n_samples is None:
+            self.eval_test_set_every_n_batches = save_every_n_batches
+        else:
+            self.eval_test_set_every_n_batches = (
+                eval_test_set_every_n_samples // batch_size
+            )
+
         self.save_path = save_path
         self.save_every_n_batches = save_every_n_batches
         self.test_set_evaluator = test_set_evaluator
@@ -82,7 +101,7 @@ class Trainer:
         if continue_training:
             self.load_checkpoint()
 
-    def run_batch(self, images, vectors):
+    def run_batch(self, images, vectors, durations=None, labels=None):
 
         current_state = dict()
 
@@ -93,22 +112,37 @@ class Trainer:
         else:
             vectors = None
 
+        if durations is not None and not np.all(pandas.isnull(durations)):
+            durations = durations.cuda(non_blocking=True)
+        else:
+            durations = None
+
+        if labels is not None:
+            labels = labels.cuda(non_blocking=True)
+
         self.optimizer.zero_grad()
-        losses = self.model.run_batch(images, vectors)
+        if self.run_batch_fn is not None:
+            losses = self.run_batch_fn(self.model, images, vectors, durations, labels)
+        else:
+            losses = self.model.run_batch(images, vectors, durations, labels)
 
         total_loss = 0.0
         for loss_name, value in losses.items():
+            if isinstance(value, dict):
+                current_state = {**current_state, **value}
+                continue
+
             if value.requires_grad:
                 total_loss += value
 
             current_state[loss_name] = float(value.detach().cpu().numpy())
+
         total_loss.backward()
         self.optimizer.step()
 
         return current_state
 
-    def run_epoch(self):
-
+    def check_init_wandb(self):
         if self.use_wandb:
             import wandb
 
@@ -123,50 +157,78 @@ class Trainer:
                 config = wandb.config
                 config["optimizer"] = type(self.optimizer).__name__
 
+    def check_scale_augmenters(self):
+        if self.total_batches % 100 == 0:
+            # Scale augmentation.
+            self.batch_sampler.init_augmenters(
+                current_epoch=self.total_batches,
+                total_epochs=self.batches_to_reach_maximum_augmentation,
+            )
+
+    def save_at_n_batches(self):
+        if self.save_path is not None:
+            tqdm.auto.tqdm.write(
+                "Saving model state at batch {}..".format(self.total_batches)
+            )
+            self.save_state()
+
+    def sample_and_save_embedding(self):
+        import wandb
+
+        self.model.eval()
+
+        loss_info = dict()
+
+        if self.test_set_evaluator is not None:
+            scores, plot = self.test_set_evaluator.evaluate(
+                self.model, plot_kwargs=dict(display=False)
+            )
+            loss_info = {**loss_info, **scores}
+            loss_info["embedding"] = wandb.Image(plot)
+
+        else:
+            e, idx = sample_embeddings(self.model, self.dataset)
+            img = plot_embeddings(
+                e, idx, self.dataset, scatterplot=False, display=False
+            )
+            loss_info["embedding"] = wandb.Image(img)
+
+        self.model.train()
+
+        return loss_info
+
+    def run_epoch(self):
+
+        if self.use_wandb:
+            import wandb
+
+        self.check_init_wandb()
+
         n_batches = len(self.batch_sampler)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer, 0.001, total_steps=n_batches
+            self.optimizer, self.max_lr, total_steps=n_batches
         )
 
         for _, batch in enumerate(tqdm.auto.tqdm(self.dataloader, leave=False)):
 
-            if self.total_batches % 100 == 0:
-                # Scale augmentation.
-                batches_to_reach_maximum_augmentation = 2000
-                self.batch_sampler.init_augmenters(
-                    current_epoch=self.total_batches,
-                    total_epochs=batches_to_reach_maximum_augmentation,
-                )
+            self.check_scale_augmenters()
 
             loss_info = self.run_batch(*batch)
 
             self.total_batches += 1
 
             if (self.total_batches + 1) % (self.save_every_n_batches + 1) == 0:
-                if self.save_path is not None:
-                    tqdm.auto.tqdm.write(
-                        "Saving model state at batch {}..".format(self.total_batches)
-                    )
-                    self.save_state()
+                self.save_at_n_batches()
+
+            if (self.total_batches + 1) % (self.eval_test_set_every_n_batches + 1) == 0:
+                additional_vars = None
 
                 if self.use_wandb:
-                    self.model.eval()
+                    with torch.no_grad():
+                        additional_vars = self.sample_and_save_embedding()
 
-                    if self.test_set_evaluator is not None:
-                        scores, plot = self.test_set_evaluator.evaluate(
-                            self.model, plot_kwargs=dict(display=False)
-                        )
-                        loss_info = {**loss_info, **scores}
-                        loss_info["embedding"] = wandb.Image(plot)
-
-                    else:
-                        e, idx = sample_embeddings(self.model, self.dataset)
-                        img = plot_embeddings(
-                            e, idx, self.dataset, scatterplot=False, display=False
-                        )
-                        loss_info["embedding"] = wandb.Image(img)
-
-                    self.model.train()
+                if additional_vars is not None:
+                    loss_info = {**loss_info, **additional_vars}
 
             scheduler.step()
 
@@ -185,8 +247,11 @@ class Trainer:
                 self.save_state(copy_suffix="_epoch{:03d}".format(self.total_epochs))
 
     def save_state(self, copy_suffix=None):
+
+        model_state_dict = self.model.state_dict()
+
         state = dict(
-            model=self.model.state_dict(),
+            model=model_state_dict,
             wandb_id=self.id,
             total_batches=self.total_batches,
             total_epochs=self.total_epochs,

@@ -216,7 +216,7 @@ class EmbeddingModel(torch.nn.Module):
 
         return image_embeddings, sequential_embeddings, predictions
 
-    def run_batch(self, images, vectors):
+    def run_batch(self, images, vectors, durations=None, labels=None):
         batch_size, L = images.shape[:2]
         base = images[:, : -len(self.predictors), :, :]
 

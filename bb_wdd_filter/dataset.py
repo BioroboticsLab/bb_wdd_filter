@@ -8,10 +8,15 @@ import pathlib
 import pandas
 import pickle
 import PIL
+import scipy.spatial.distance
+import skimage.transform
+import sklearn.metrics
 import torchvision.transforms
 import torch
+import torch.utils.data
 import tqdm.auto
 import zipfile
+import sklearn.preprocessing
 
 
 class WDDDataset:
@@ -26,13 +31,18 @@ class WDDDataset:
         image_size=128,
         silently_skip_invalid=True,
         load_wdd_vectors=False,
+        load_wdd_durations=False,
+        wdd_angles_for_samples=None,
+        default_image_scale=0.5,
     ):
 
         self.load_wdd_vectors = load_wdd_vectors
+        self.load_wdd_durations = load_wdd_durations
         self.silently_skip_invalid = silently_skip_invalid
         self.images_in_archives = images_in_archives
         self.sample_gaps = False
         self.all_meta_files = []
+        self.wdd_angles_for_samples = wdd_angles_for_samples
 
         # Count and index waggle information.
         if isinstance(paths, str):
@@ -62,7 +72,10 @@ class WDDDataset:
         self.target_offset = target_offset
 
         self.default_crop = iaa.Sequential(
-            [iaa.Resize(0.5), iaa.CenterCropToFixedSize(image_size, image_size)]
+            [
+                iaa.Resize(default_image_scale),
+                iaa.CenterCropToFixedSize(image_size, image_size),
+            ]
         )
 
         self.normalize_to_float = iaa.Sequential(
@@ -74,7 +87,7 @@ class WDDDataset:
         )
 
     def load_and_normalize_image(self, filename):
-        img = WDDDataset.load_image()
+        img = WDDDataset.load_image(filename)
 
         img = self.default_crop.augment_images(img)
         assert img.max() > 1
@@ -123,8 +136,10 @@ class WDDDataset:
         try:
             waggle_angle = waggle_metadata["waggle_angle"]
             assert np.abs(waggle_angle) < np.pi * 2.0
+            waggle_duration = waggle_metadata["waggle_duration"]
         except:
             waggle_angle = np.nan
+            waggle_duration = np.nan
 
         if temporal_dimension is not None:
             target_sequence_length = n_targets * target_offset
@@ -137,12 +152,8 @@ class WDDDataset:
                     0, available_frames_length - sequence_length
                 )
             else:
-                # Just start taking X images, starting in the middle.
                 sequence_center = available_frames_length // 2
-                if sequence_center >= target_sequence_length:
-                    sequence_start = sequence_center
-                else:  # Or take the center X images.
-                    sequence_start = sequence_center - sequence_length // 2
+                sequence_start = sequence_center - sequence_length // 2
 
             assert available_frames_length >= target_sequence_length + sequence_length
 
@@ -157,6 +168,13 @@ class WDDDataset:
                         ]
                 return images
 
+            if len(images) != available_frames_length:
+                print(
+                    "N images: {}, available_frames_length: {}".format(
+                        len(images), available_frames_length
+                    )
+                )
+
             assert len(images) == available_frames_length
             images = images[sequence_start : (sequence_start + sequence_length)]
 
@@ -170,16 +188,21 @@ class WDDDataset:
             if temporal_dimension == sequence_length - target_sequence_length:
                 images = images[:targets_start]
             else:
-                images = [
-                    images[idx]
-                    for idx in sorted(
-                        np.random.choice(
-                            sequence_length - target_sequence_length,
-                            size=temporal_dimension,
-                            replace=False,
+                if return_center_images:
+                    mid = len(images) // 2
+                    margin = temporal_dimension // 2
+                    images = images[(mid - margin) : (mid + margin + 1)]
+                else:
+                    images = [
+                        images[idx]
+                        for idx in sorted(
+                            np.random.choice(
+                                sequence_length - target_sequence_length,
+                                size=temporal_dimension,
+                                replace=False,
+                            )
                         )
-                    )
-                ]
+                    ]
             return images + targets
 
         if images_in_archives:
@@ -203,11 +226,15 @@ class WDDDataset:
             images = list(
                 sorted([f for f in os.listdir(waggle_dir) if f.endswith("png")])
             )
+            if len(images) == 0:
+                print("No images found in folder {}.".format(waggle_dir))
+            assert len(images) > 0
+
             images = select_images_from_list(images)
             if load_images:
                 images = WDDDataset.load_images(images, waggle_dir)
 
-        return images, waggle_angle
+        return images, waggle_angle, waggle_duration
 
     def __len__(self):
         return len(self.all_meta_files)
@@ -222,7 +249,7 @@ class WDDDataset:
     ):
         waggle_metadata_path = self.all_meta_files[i]
 
-        images, waggle_angle = WDDDataset.load_metadata_for_waggle(
+        images, waggle_angle, waggle_duration = WDDDataset.load_metadata_for_waggle(
             waggle_metadata_path,
             self.temporal_dimension,
             images_in_archives=self.images_in_archives,
@@ -230,6 +257,10 @@ class WDDDataset:
             target_offset=self.target_offset,
             return_center_images=return_center_images,
         )
+
+        if self.wdd_angles_for_samples is not None:
+            waggle_angle = self.wdd_angles_for_samples[i]
+
         if images is None:
             if self.silently_skip_invalid:
                 return self[i + 1]
@@ -258,14 +289,28 @@ class WDDDataset:
         else:
             waggle_vector = None
 
-        return images, waggle_vector
+        if not self.load_wdd_durations:
+            waggle_duration = None
+
+        return images, waggle_vector, waggle_duration
 
 
 class BatchSampler:
-    def __init__(self, dataset, batch_size, image_size=32):
+    def __init__(
+        self,
+        dataset,
+        batch_size,
+        image_size=32,
+        inflate_dataset_factor=1,
+        image_scale_factor=0.5,
+        augmentation_per_image=True,
+    ):
         self.batch_size = batch_size
         self.dataset = dataset
         self.total_length = len(dataset)
+        self.inflate_dataset_factor = int(inflate_dataset_factor)
+        self.image_scale_factor = image_scale_factor
+        self.augmentation_per_image = augmentation_per_image
 
         self.augmenters = None
         self.image_size = image_size
@@ -275,16 +320,17 @@ class BatchSampler:
         p = np.clip(
             0.1 + np.log1p(2 * current_epoch / (max(1, total_epochs - 1))), 0, 1
         )
+
         # p = 0.0
 
         # These are applied to each image individually and must not rotate e.g. the images.
         self.quality_augmenters = iaa.Sequential(
             [
-                iaa.Sometimes(0.55 * p, iaa.GammaContrast((0.75, 1.25))),
-                iaa.Sometimes(0.25 * p, iaa.SaltAndPepper(0.05)),
-                iaa.Sometimes(0.5 * p, iaa.AdditiveGaussianNoise(scale=(0, 0.2))),
-                iaa.Sometimes(0.25 * p, iaa.GaussianBlur(sigma=(0.0, 1.5))),
-                iaa.Add(value=(-15, 15)),
+                iaa.Sometimes(0.55 * p, iaa.GammaContrast((0.9, 1.1))),
+                iaa.Sometimes(0.25 * p, iaa.SaltAndPepper(0.01)),
+                iaa.Sometimes(0.5 * p, iaa.AdditiveGaussianNoise(scale=(0, 0.1))),
+                iaa.Sometimes(0.25 * p, iaa.GaussianBlur(sigma=(0.0, 0.5))),
+                iaa.Sometimes(0.25 * p, iaa.Add(value=(-5, 5))),
             ]
         )
         self.rescale = iaa.Sequential(
@@ -298,18 +344,18 @@ class BatchSampler:
         # These are sampled for each batch and applied to all images.
         self.augmenters = iaa.Sequential(
             [
-                iaa.Sometimes(
-                    0.25 * p,
-                    iaa.Affine(
-                        translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
-                        rotate=(0, 360),
-                        scale={"x": (0.9, 1.1), "y": (0.9, 1.1)},
-                    ),
+                iaa.Affine(
+                    translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
+                    rotate=0.0,
+                    shear=(-5, 5),
+                    scale={"x": (0.8, 1.2), "y": (0.8, 1.2)},
                 ),
                 iaa.CropToFixedSize(
-                    self.image_size * 2, self.image_size * 2, position="center"
+                    self.image_size * int(1.0 / self.image_scale_factor),
+                    self.image_size * int(1.0 / self.image_scale_factor),
+                    position="center",
                 ),
-                iaa.Resize(0.5),
+                iaa.Resize(self.image_scale_factor),
                 iaa.Sometimes(
                     0.25 * p,
                     iaa.Sequential(
@@ -333,7 +379,7 @@ class BatchSampler:
         # self.augmenters = iaa.Sequential([iaa.CropToFixedSize(128, 128, position="center")])
 
     def __len__(self):
-        return self.total_length // self.batch_size
+        return (self.total_length * self.inflate_dataset_factor) // self.batch_size
 
     def __getitem__(self, _):
 
@@ -344,7 +390,11 @@ class BatchSampler:
 
         def augment_fn(images, *args):
             nonlocal aug
-            images = self.quality_augmenters.augment_images(images)
+            img_aug = self.quality_augmenters
+            if not self.augmentation_per_image:
+                # Apply the same augmentation to the whole sequence.
+                img_aug = img_aug.to_deterministic()
+            images = img_aug.augment_images(images)
             images = self.rescale.augment_images(
                 [img.astype(np.float32) for img in images]
             )
@@ -352,32 +402,43 @@ class BatchSampler:
             return images, angles
 
         samples, angles = [], []
+        has_labels = False
+        labels = []
 
         for _ in range(self.batch_size):
             idx = np.random.randint(self.total_length)
-            images, angle = self.dataset.__getitem__(idx, aug=augment_fn)
+            sample_data = self.dataset.__getitem__(idx, aug=augment_fn)
+            label = None
+            if len(sample_data) == 2:
+                images, angle = sample_data
+            else:
+                images, angle, label = sample_data
+                has_labels = True
+
             samples.append(images)
             angles.append(angle)
+            labels.append(label)
 
-        return np.stack(samples, axis=0), np.stack(angles, axis=0)
+        samples = np.stack(samples, axis=0)
+        angles = np.stack(angles, axis=0)
+
+        if not has_labels:
+            return samples, angles
+
+        labels = np.stack(labels, axis=0)
+        return samples, angles, labels
 
     @classmethod
-    def augment_sequence(self, aug, images, angle):
+    def augment_sequence(self, aug, images, angle, rotate=True):
 
-        random_state = aug.random_state.duplicate(12)[6]
-        if len(aug) > 1:
-            rotation = (
-                aug[0].then_list[0].rotate.draw_sample(random_state=random_state.copy())
-            )
-            rotation = rotation / 180.0 * np.pi
-            assert np.abs(rotation) <= np.pi * 2.0
-        else:
-            rotation = 0.0
+        rotation = np.random.randint(0, 360)
 
         for idx, img in enumerate(images):
+            if rotate:
+                img = skimage.transform.rotate(img, rotation)
             images[idx] = aug.augment_image(img)
 
-        return images, angle + rotation
+        return images, angle + rotation / 180.0 * np.pi
 
 
 class ValidationDatasetEvaluator:
@@ -393,25 +454,9 @@ class ValidationDatasetEvaluator:
     ):
 
         if raw_paths is None:
-            with open(gt_data_path, "rb") as f:
-                wdd_gt_data = pickle.load(f)
-            self.gt_data_df = [(key,) + v for key, v in wdd_gt_data.items()]
-            self.gt_data_df = pandas.DataFrame(
-                self.gt_data_df, columns=["waggle_id", "label", "gt_angle", "path"]
+            self.gt_data_df, paths = ValidationDatasetEvaluator.load_ground_truth_data(
+                gt_data_path, remap_paths_to=remap_paths_to
             )
-            paths = list(self.gt_data_df.path.values)
-
-            if remap_paths_to:
-
-                def rewrite(p):
-                    p = str(p).replace(
-                        "/mnt/curta/storage/beesbook/wdd/", remap_paths_to
-                    )
-                    p = pathlib.Path(p)
-                    return p
-
-                paths = [rewrite(p) for p in paths]
-
         else:
             paths = raw_paths
 
@@ -426,11 +471,36 @@ class ValidationDatasetEvaluator:
 
         self.return_indices = return_indices
 
+    @staticmethod
+    def load_ground_truth_data(gt_data_path, remap_paths_to=""):
+        if isinstance(gt_data_path, str):
+            with open(gt_data_path, "rb") as f:
+                wdd_gt_data = pickle.load(f)
+                gt_data_df = [(key,) + v for key, v in wdd_gt_data.items()]
+        else:
+            gt_data_df = gt_data_path
+
+        gt_data_df = pandas.DataFrame(
+            gt_data_df, columns=["waggle_id", "label", "gt_angle", "path"]
+        )
+        paths = list(gt_data_df.path.values)
+
+        if remap_paths_to:
+
+            def rewrite(p):
+                p = str(p).replace("/mnt/curta/storage/beesbook/wdd/", remap_paths_to)
+                p = pathlib.Path(p)
+                return p
+
+            paths = [rewrite(p) for p in paths]
+
+        return gt_data_df, paths
+
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, i):
-        batch_images, vectors = self.dataset.__getitem__(
+        batch_images, vectors, durations = self.dataset.__getitem__(
             i, normalize_to_float=True, return_center_images=True
         )
 
@@ -491,7 +561,7 @@ class ValidationDatasetEvaluator:
                         check_length=False,
                     )
 
-                    if not use_last_state:
+                    if not use_last_state and model.lstm is not None:
                         embedding = torch.mean(embedding[:, 0], dim=0)
 
                     embedding = embedding.detach().cpu().numpy().flatten()
@@ -568,3 +638,178 @@ class ValidationDatasetEvaluator:
         plot = self.plot_embeddings(images, embeddings, labels, **plot_kwargs)
 
         return scores, plot
+
+
+class SupervisedDataset:
+    def __init__(
+        self,
+        gt_paths,
+        image_size=32,
+        temporal_dimension=60,
+        remap_paths_to="/mnt/thekla/",
+        images_in_archives=False,
+        **kwargs,
+    ):
+
+        self.gt_data_df, self.paths = ValidationDatasetEvaluator.load_ground_truth_data(
+            gt_paths, remap_paths_to=remap_paths_to
+        )
+        self.dataset = WDDDataset(
+            self.paths,
+            images_in_archives=images_in_archives,
+            temporal_dimension=temporal_dimension,
+            image_size=image_size,
+            n_targets=0,
+            silently_skip_invalid=False,
+            wdd_angles_for_samples=self.gt_data_df.gt_angle.values,
+            **kwargs,
+        )
+
+        labels = self.gt_data_df.label.copy()
+        labels[labels == "trembling"] = "other"
+        self.all_labels = ["other", "waggle", "ventilating", "activating"]
+        label_mapper = {s: i for i, s in enumerate(self.all_labels)}
+        self.Y = np.array([label_mapper[l] for l in labels])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i, **kwargs):
+        images, vector, duration = self.dataset.__getitem__(i, **kwargs)
+        label = self.Y[i]
+
+        # Add empty channel dimension.
+        images = np.expand_dims(images, 0)
+
+        return images, vector, label
+
+
+class SupervisedValidationDatasetEvaluator:
+    def __init__(
+        self,
+        gt_data_path,
+        remap_paths_to="/mnt/thekla/",
+        images_in_archives=False,
+        image_size=128,
+        temporal_dimension=None,
+        return_indices=False,
+        default_image_scale=0.25,
+    ):
+
+        self.dataset = SupervisedDataset(
+            gt_data_path,
+            images_in_archives=images_in_archives,
+            image_size=image_size,
+            load_wdd_vectors=True,
+            remap_paths_to=remap_paths_to,
+            default_image_scale=default_image_scale,
+        )
+
+        self.return_indices = return_indices
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+
+        item = self.dataset.__getitem__(
+            i, normalize_to_float=True, return_center_images=True
+        )
+
+        if self.return_indices:
+            return i, item
+        return item
+
+    def evaluate(self, model, plot_kwargs=dict()):
+
+        dataloader = torch.utils.data.DataLoader(
+            self, num_workers=0, batch_size=16, shuffle=False, drop_last=False
+        )
+
+        all_classes_hat = []
+        all_vectors_hat = []
+        all_durations_hat = []
+        all_classes = self.dataset.Y
+        all_vectors = []
+        all_durations = []
+
+        for (images, vectors, durations, _) in dataloader:
+            predictions = model(images.cuda())
+            assert predictions.shape[2] == 1
+            assert predictions.shape[3] == 1
+            assert predictions.shape[4] == 1
+            predictions = predictions[:, :, 0, 0, 0]
+
+            n_classes = 4
+            classes_hat = predictions[:, :n_classes]
+            vectors_hat = predictions[:, n_classes : (n_classes + 2)]
+            durations_hat = predictions[:, (n_classes + 2) : (n_classes + 3)]
+
+            vectors_hat = torch.tanh(vectors_hat)
+            durations_hat = torch.relu(durations_hat)
+
+            classes_hat = torch.nn.functional.softmax(classes_hat, dim=1)
+
+            classes_hat = classes_hat.detach().cpu().numpy()
+            vectors_hat = vectors_hat.detach().cpu().numpy()
+            durations_hat = durations_hat.detach().cpu().numpy()
+
+            all_classes_hat.append(classes_hat)
+            all_vectors_hat.append(vectors_hat)
+            all_durations_hat.append(durations_hat)
+            all_vectors.append(vectors)
+            all_durations.append(durations)
+
+        all_classes_hat = np.concatenate(all_classes_hat, axis=0)
+        all_classes_hat_argmax = np.argmax(all_classes_hat, axis=1)
+        all_vectors_hat = np.concatenate(all_vectors_hat, axis=0)
+        all_durations_hat = np.concatenate(all_durations_hat, axis=0)
+        all_vectors = np.concatenate(all_vectors, axis=0)
+        all_durations = np.concatenate(all_durations, axis=0)
+
+        metrics = dict()
+        metrics["test_balanced_accuracy"] = sklearn.metrics.balanced_accuracy_score(
+            all_classes, all_classes_hat_argmax, adjusted=True
+        )
+        metrics["test_roc_auc_score"] = sklearn.metrics.roc_auc_score(
+            all_classes, all_classes_hat, multi_class="ovr"
+        )
+        metrics["test_matthews"] = sklearn.metrics.matthews_corrcoef(
+            all_classes, all_classes_hat_argmax
+        )
+        metrics["test_f1_weighted"] = sklearn.metrics.f1_score(
+            all_classes, all_classes_hat_argmax, average="weighted"
+        )
+
+        metrics["test_angle_cosine"] = 1.0 - np.mean(
+            [
+                scipy.spatial.distance.cosine(a, b)
+                for (a, b) in zip(all_vectors, all_vectors_hat)
+            ]
+        )
+
+        idx = ~pandas.isnull(all_durations)
+        all_durations = all_durations[idx]
+        all_durations_hat = all_durations_hat[idx]
+        metrics["test_duration_mse"] = sklearn.metrics.mean_squared_error(
+            all_durations, all_durations_hat
+        )
+
+        return metrics
+
+
+class WDDDatasetWithIndicesAndNormalized:
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+        item = self.dataset.__getitem__(
+            i,
+            return_just_one=False,
+            normalize_to_float=True,
+            return_center_images=True,
+        )
+        return i, item
