@@ -6,28 +6,50 @@ import torch.utils
 import torchvision.transforms.functional
 
 
+class TensorView(torch.nn.Module):
+    def __init__(self, *shape):
+        self.shape = shape
+
+    def forward(self, t):
+        return t.view(*self.shape)
+
+
 class WDDClassificationModel(torch.nn.Module):
-    def __init__(self, n_outputs=7, image_size=32, scaledown_factor=4):
+    def __init__(
+        self,
+        n_outputs=7,
+        temporal_dimension=40,
+        image_size=32,
+        scaledown_factor=4,
+        inplace=False,
+    ):
 
         super().__init__()
 
         center_stride = image_size // 32
         center_padding = 2 if image_size == 32 else 0
 
+        if temporal_dimension == 60:
+            center_temporal_stride = 2
+            center_temporal_kernel_size = 3
+        else:
+            assert temporal_dimension == 40
+            center_temporal_stride = 1
+            center_temporal_kernel_size = 5
+
         s = scaledown_factor
 
         self.seq = [
-            # 60 x 32 - 60 x 64
-            torch.nn.Conv3d(1, 256 // s, kernel_size=5, stride=1, padding=0),
-            torch.nn.BatchNorm3d(256 // s),
-            torch.nn.Mish(inplace=True),
-            # 56 x 28 - 56 x 60
+            torch.nn.Conv3d(1, 128 // s, kernel_size=5, stride=1, padding=0),
+            torch.nn.BatchNorm3d(128 // s),
+            torch.nn.Mish(inplace=inplace),
+            # 36/56 x 28 - 56 x 60
             torch.nn.Conv3d(
-                256 // s, 64 // s, kernel_size=3, stride=1, padding=0, dilation=2
+                128 // s, 64 // s, kernel_size=3, stride=1, padding=0, dilation=2
             ),
             torch.nn.BatchNorm3d(64 // s),
-            torch.nn.Mish(inplace=True),
-            # 52 x 24 - 52 x 56
+            torch.nn.Mish(inplace=inplace),
+            # 32/52 x 24 - 52 x 56
             torch.nn.Conv3d(
                 64 // s,
                 64 // s,
@@ -37,8 +59,8 @@ class WDDClassificationModel(torch.nn.Module):
                 dilation=(2, 1, 1),
             ),
             torch.nn.BatchNorm3d(64 // s),
-            torch.nn.Mish(inplace=True),
-            # 25 x 12 - 25 x 28
+            torch.nn.Mish(inplace=inplace),
+            # 15/25 x 12 - 25 x 28
             torch.nn.Conv3d(
                 64 // s,
                 64 // s,
@@ -48,19 +70,19 @@ class WDDClassificationModel(torch.nn.Module):
                 dilation=1,
             ),
             torch.nn.BatchNorm3d(64 // s),
-            torch.nn.Mish(inplace=True),
-            # 25 x 12 - 25 x 12
+            torch.nn.Mish(inplace=inplace),
+            # 15/25 x 12 - 25 x 12
             torch.nn.Conv3d(
                 64 // s,
                 128 // s,
-                kernel_size=3,
-                stride=2,
+                kernel_size=(center_temporal_kernel_size, 3, 3),
+                stride=(center_temporal_stride, 2, 2),
                 padding=(0, 1, 1),
                 dilation=1,
             ),
             torch.nn.BatchNorm3d(128 // s),
             torch.nn.FeatureAlphaDropout(),
-            torch.nn.Mish(inplace=True),
+            torch.nn.Mish(inplace=inplace),
             # 12 x 6 - 12 x 6
             torch.nn.Conv3d(
                 128 // s,
@@ -72,7 +94,7 @@ class WDDClassificationModel(torch.nn.Module):
             ),
             torch.nn.BatchNorm3d(128 // s),
             torch.nn.GLU(dim=1),
-            torch.nn.Mish(inplace=True),
+            torch.nn.Mish(inplace=inplace),
             # 5 x 4 - 5 x 4
             torch.nn.Conv3d(64 // s, n_outputs, kernel_size=(5, 4, 4)),
         ]
@@ -103,11 +125,11 @@ class WDDClassificationModel(torch.nn.Module):
     def load_state_dict(self, d):
         try:
             return super().load_state_dict(d)
-        except:
+        except Exception as e:
             print("Failed to load. Trying without DataParallel prefix.")
-            # Strip off Wrapper & DataParallel prefix.
-            d = {key.replace("model.module.", ""): v for key, v in d.items()}
-            return super().load_state_dict(d)
+        # Strip off Wrapper & DataParallel prefix.
+        d = {key.replace("model.module.", ""): v for key, v in d.items()}
+        return super().load_state_dict(d)
 
 
 # To support DataParallel.
@@ -183,6 +205,7 @@ class SupervisedModelTrainWrapper(torch.nn.Module):
         return results
 
     def run_batch(self, images, vectors, durations, labels):
+        # print(images.dtype, vectors.dtype, durations.dtype)
         batch_size, temp_dimension = images.shape[:2]
         model = self.model
 
@@ -192,7 +215,7 @@ class SupervisedModelTrainWrapper(torch.nn.Module):
 
         classes_hat = all_outputs[:, :n_classes]
         vectors_hat = all_outputs[:, n_classes : (n_classes + 2)]
-        durations_hat = all_outputs[:, (n_classes + 2) : (n_classes + 3)]
+        durations_hat = all_outputs[:, (n_classes + 2)]
 
         losses = dict()
 

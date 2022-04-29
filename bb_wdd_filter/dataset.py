@@ -265,7 +265,7 @@ class WDDDataset:
             if self.silently_skip_invalid:
                 return self[i + 1]
             else:
-                return None, None
+                return None, None, None
         if return_just_one:
             images = images[:1]
         # images = WDDDataset.load_images(image_filenames, parent=waggle_metadata_path.parent)
@@ -292,7 +292,7 @@ class WDDDataset:
         if not self.load_wdd_durations:
             waggle_duration = None
 
-        return images, waggle_vector, waggle_duration
+        return images, waggle_vector, np.float32(waggle_duration)
 
 
 class BatchSampler:
@@ -401,7 +401,7 @@ class BatchSampler:
             images, angles = BatchSampler.augment_sequence(aug, images, *args)
             return images, angles
 
-        samples, angles = [], []
+        samples, angles, durations = [], [], []
         has_labels = False
         labels = []
 
@@ -410,23 +410,25 @@ class BatchSampler:
             sample_data = self.dataset.__getitem__(idx, aug=augment_fn)
             label = None
             if len(sample_data) == 2:
-                images, angle = sample_data
+                images, angle, duration = sample_data
             else:
-                images, angle, label = sample_data
+                images, angle, duration, label = sample_data
                 has_labels = True
 
             samples.append(images)
             angles.append(angle)
+            durations.append(duration)
             labels.append(label)
 
         samples = np.stack(samples, axis=0)
         angles = np.stack(angles, axis=0)
+        durations = np.stack(durations, axis=0)
 
         if not has_labels:
-            return samples, angles
+            return samples, angles, durations
 
         labels = np.stack(labels, axis=0)
-        return samples, angles, labels
+        return samples, angles, durations, labels
 
     @classmethod
     def augment_sequence(self, aug, images, angle, rotate=True):
@@ -645,7 +647,7 @@ class SupervisedDataset:
         self,
         gt_paths,
         image_size=32,
-        temporal_dimension=60,
+        temporal_dimension=40,
         remap_paths_to="/mnt/thekla/",
         images_in_archives=False,
         **kwargs,
@@ -681,7 +683,7 @@ class SupervisedDataset:
         # Add empty channel dimension.
         images = np.expand_dims(images, 0)
 
-        return images, vector, label
+        return images, vector, duration, label
 
 
 class SupervisedValidationDatasetEvaluator:
@@ -694,6 +696,7 @@ class SupervisedValidationDatasetEvaluator:
         temporal_dimension=None,
         return_indices=False,
         default_image_scale=0.25,
+        class_labels=["other", "waggle", "ventilating", "activating"]
     ):
 
         self.dataset = SupervisedDataset(
@@ -701,11 +704,13 @@ class SupervisedValidationDatasetEvaluator:
             images_in_archives=images_in_archives,
             image_size=image_size,
             load_wdd_vectors=True,
+            load_wdd_durations=True,
             remap_paths_to=remap_paths_to,
             default_image_scale=default_image_scale,
         )
 
         self.return_indices = return_indices
+        self.class_labels = class_labels
 
     def __len__(self):
         return len(self.dataset)
@@ -787,6 +792,16 @@ class SupervisedValidationDatasetEvaluator:
                 for (a, b) in zip(all_vectors, all_vectors_hat)
             ]
         )
+
+        for i in range(1, len(self.class_labels)):
+            label = self.class_labels[i]
+            Y_hat = all_classes_hat_argmax == i
+            Y = all_classes == i
+
+            metrics[f"test_precision_{label}"] = sklearn.metrics.precision_score(Y, Y_hat)
+            metrics[f"test_recall_{label}"] = sklearn.metrics.recall_score(Y, Y_hat)
+
+            
 
         idx = ~pandas.isnull(all_durations)
         all_durations = all_durations[idx]

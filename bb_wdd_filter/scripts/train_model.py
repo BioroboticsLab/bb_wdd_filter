@@ -57,7 +57,7 @@ def run(
 
     model = model.cuda()
 
-    batch_size = int((32 * 4 * 2) / ((image_size * image_size) / (32 * 32)))
+    batch_size = int((64 * 7 * 2) / ((image_size * image_size) / (32 * 32)))
     print(
         "N pars: ",
         str(sum(p.numel() for p in model.parameters() if p.requires_grad)),
@@ -75,13 +75,13 @@ def run(
         image_size=image_size,
         batch_sampler_kwargs=dict(
             image_scale_factor=image_scale,
-            inflate_dataset_factor=100,
+            inflate_dataset_factor=1000,
             augmentation_per_image=False,
         ),
         test_set_evaluator=evaluator,
         eval_test_set_every_n_samples=2000,
-        save_every_n_samples=50000,
-        max_lr=0.001 * 8,
+        save_every_n_samples=200000,
+        max_lr=0.002 * 8,
         batches_to_reach_maximum_augmentation=1000,
     )
 
