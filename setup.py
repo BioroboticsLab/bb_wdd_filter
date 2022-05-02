@@ -27,5 +27,5 @@ setup(
     install_requires=reqs,
     dependency_links=dep_links,
     packages=find_packages(),
-    package_dir={"bb_wdd_filter": "bb_wdd_filter/"},
+    package_dir={"bb_wdd_filter": "bb_wdd_filter"},
 )
