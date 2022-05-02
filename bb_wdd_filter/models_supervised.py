@@ -5,6 +5,7 @@ import torch.nn
 import torch.utils
 import torchvision.transforms.functional
 
+DEFAULT_CLASS_LABELS = ["other", "waggle", "ventilating", "activating"]
 
 class TensorView(torch.nn.Module):
     def __init__(self, *shape):
@@ -101,6 +102,32 @@ class WDDClassificationModel(torch.nn.Module):
 
         self.seq = torch.nn.Sequential(*self.seq)
 
+    def postprocess_predictions(self, all_outputs, return_raw=False, as_numpy=False):
+        
+        n_classes = 4
+
+        classes_hat = all_outputs[:, :n_classes]
+        vectors_hat = all_outputs[:, n_classes : (n_classes + 2)]
+        durations_hat = all_outputs[:, (n_classes + 2)]
+
+        confidences = None
+
+        if not return_raw:
+            probabilities = torch.nn.functional.softmax(classes_hat, 1)
+            classes_hat = torch.argmax(probabilities, 1)
+            confidences = probabilities[np.arange(probabilities.shape[0]), classes_hat]
+            vectors_hat = torch.tanh(vectors_hat)
+            durations_hat = torch.relu(durations_hat)
+        
+        if as_numpy:
+            classes_hat = classes_hat.detach().cpu().numpy()
+            vectors_hat = vectors_hat.detach().cpu().numpy()
+            durations_hat = durations_hat.detach().cpu().numpy()
+            if confidences is not None:
+                confidences = confidences.detach().cpu().numpy()
+
+        return classes_hat, vectors_hat, durations_hat, confidences
+
     def forward(self, images):
         if self.training:
             images.requires_grad = True
@@ -135,7 +162,7 @@ class WDDClassificationModel(torch.nn.Module):
 # To support DataParallel.
 class SupervisedModelTrainWrapper(torch.nn.Module):
     def __init__(
-        self, model, class_labels=["other", "waggle", "ventilating", "activating"]
+        self, model, class_labels=DEFAULT_CLASS_LABELS
     ):
 
         super().__init__()
@@ -146,7 +173,7 @@ class SupervisedModelTrainWrapper(torch.nn.Module):
         self.class_labels = class_labels
 
         self.model = model
-
+    
     def forward(self, x):
         return self.model(x)
 
@@ -210,12 +237,7 @@ class SupervisedModelTrainWrapper(torch.nn.Module):
         model = self.model
 
         all_outputs = model(images)
-        n_classes = 4
-        n_targets = n_classes + 2
-
-        classes_hat = all_outputs[:, :n_classes]
-        vectors_hat = all_outputs[:, n_classes : (n_classes + 2)]
-        durations_hat = all_outputs[:, (n_classes + 2)]
+        classes_hat, vectors_hat, durations_hat, _ = model.postprocess_predictions(all_outputs, return_raw=True)        
 
         losses = dict()
 
