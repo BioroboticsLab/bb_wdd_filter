@@ -18,6 +18,48 @@ import tqdm.auto
 import zipfile
 import sklearn.preprocessing
 
+class ImageNormalizer:
+    def __init__(self, image_size, scale_factor):
+        self.image_size = image_size
+        self.scale_factor = scale_factor
+
+        self.crop = iaa.Sequential(
+            [
+                iaa.Resize(scale_factor),
+                iaa.CenterCropToFixedSize(image_size, image_size),
+            ]
+        )
+
+        self.normalize_to_float = iaa.Sequential(
+            [
+                # Scale to range -1, +1
+                iaa.Multiply(2.0 / 255.0),
+                iaa.Add(-1.0),
+            ]
+        )
+
+    def crop_images(self, images):
+        images = self.crop.augment_images(images)
+        return images
+
+    def floatify_image(self, img):
+
+        if not np.issubdtype(img.dtype, np.floating):
+            assert img.max() > 1
+            img = img.astype(np.float32)
+        else:
+            img = 255.0 * img
+
+        img = self.normalize_to_float.augment_image(img)
+        return img
+
+    def floatify_images(self, images):
+        images = [self.floatify_image(img) for img in images]
+        return images
+
+    def normalize_images(self, images):
+        return self.floatify_images(self.crop_images(images))
+        
 
 class WDDDataset:
     def __init__(
@@ -71,28 +113,15 @@ class WDDDataset:
         self.n_targets = n_targets
         self.target_offset = target_offset
 
-        self.default_crop = iaa.Sequential(
-            [
-                iaa.Resize(default_image_scale),
-                iaa.CenterCropToFixedSize(image_size, image_size),
-            ]
-        )
-
-        self.normalize_to_float = iaa.Sequential(
-            [
-                # Scale to range -1, +1
-                iaa.Multiply(2.0 / 255.0),
-                iaa.Add(-1.0),
-            ]
-        )
+        self.default_normalizer = ImageNormalizer(image_size=image_size,
+                scale_factor=default_image_scale)
+        
 
     def load_and_normalize_image(self, filename):
         img = WDDDataset.load_image(filename)
 
-        img = self.default_crop.augment_images(img)
-        assert img.max() > 1
-        img = img.astype(np.float32)
-        img = self.normalize_to_float.augment_image(img)
+        img = self.default_normalizer.crop_images(img)
+        img = self.default_normalizer.floatify_image(img)
 
         return img
 
@@ -272,12 +301,10 @@ class WDDDataset:
         if aug is not None:
             images, waggle_angle = aug(images, waggle_angle)
         else:
-            images = self.default_crop.augment_images(images)
+            images = self.default_normalizer.crop_images(images)
 
         if normalize_to_float:
-            assert images[0].max() > 1
-            images = [img.astype(np.float32) for img in images]
-            images = self.normalize_to_float.augment_images(images)
+            images = self.default_normalizer.floatify_images(images)
 
         images = np.stack(images, axis=0)  # Stack over channels.
 
