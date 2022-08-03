@@ -803,9 +803,13 @@ class SupervisedValidationDatasetEvaluator:
         metrics["test_balanced_accuracy"] = sklearn.metrics.balanced_accuracy_score(
             all_classes, all_classes_hat_argmax, adjusted=True
         )
-        metrics["test_roc_auc_score"] = sklearn.metrics.roc_auc_score(
-            all_classes, all_classes_hat, multi_class="ovr"
-        )
+        try:
+            metrics["test_roc_auc_score"] = sklearn.metrics.roc_auc_score(
+                all_classes, all_classes_hat, multi_class="ovr"
+            )
+        except ValueError as e:
+            metrics["test_roc_auc_score"] = np.nan
+            
         metrics["test_matthews"] = sklearn.metrics.matthews_corrcoef(
             all_classes, all_classes_hat_argmax
         )
