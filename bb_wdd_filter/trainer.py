@@ -101,6 +101,9 @@ class Trainer:
         if continue_training:
             self.load_checkpoint()
 
+    def is_using_wandb(self):
+        return self.use_wandb
+    
     def run_batch(self, images, vectors, durations=None, labels=None):
 
         current_state = dict()

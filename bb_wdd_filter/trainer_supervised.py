@@ -28,6 +28,8 @@ class SupervisedTrainer(Trainer):
             **kwargs
         )
 
+        model.set_use_wandb(self.is_using_wandb())
+
     def sample_and_save_embedding(self):
 
         self.model.eval()

@@ -162,7 +162,7 @@ class WDDClassificationModel(torch.nn.Module):
 # To support DataParallel.
 class SupervisedModelTrainWrapper(torch.nn.Module):
     def __init__(
-        self, model, class_labels=DEFAULT_CLASS_LABELS
+        self, model, class_labels=DEFAULT_CLASS_LABELS, use_wandb=True
     ):
 
         super().__init__()
@@ -171,18 +171,19 @@ class SupervisedModelTrainWrapper(torch.nn.Module):
         self.mse = torch.nn.MSELoss()
         self.classification_loss = torch.nn.CrossEntropyLoss()
         self.class_labels = class_labels
+        self.use_wandb = use_wandb
 
         self.model = model
     
+    def set_use_wandb(self, use_wandb=True):
+        self.use_wandb = use_wandb
+        
     def forward(self, x):
         return self.model(x)
 
     def calc_additional_metrics(
         self, predictions, labels, vectors_hat, vectors, durations_hat, durations
     ):
-
-        import wandb
-
         results = dict()
 
         predictions = torch.nn.functional.softmax(predictions, dim=1)
@@ -192,12 +193,14 @@ class SupervisedModelTrainWrapper(torch.nn.Module):
 
         labels = labels.detach().cpu().numpy()
 
-        results["train_conf"] = wandb.plot.confusion_matrix(
-            probs=None,
-            y_true=labels,
-            preds=predicted_labels,
-            class_names=self.class_labels,
-        )
+        if self.use_wandb:
+            import wandb
+            results["train_conf"] = wandb.plot.confusion_matrix(
+                probs=None,
+                y_true=labels,
+                preds=predicted_labels,
+                class_names=self.class_labels,
+            )
 
         try:
             results["train_roc_auc"] = sklearn.metrics.roc_auc_score(
