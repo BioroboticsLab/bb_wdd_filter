@@ -5,6 +5,7 @@ numba
 scikit-learn
 torch
 torchvision
+tqdm
 matplotlib
 pre-commit
 black
