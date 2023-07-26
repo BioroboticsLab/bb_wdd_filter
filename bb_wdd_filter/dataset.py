@@ -781,7 +781,12 @@ class SupervisedValidationDatasetEvaluator:
         class_labels=["other", "waggle", "ventilating", "activating"],
     ):
         datasets = []
-        for kwargs in dataset_kwargs:
+        self.dataset_names = []
+        self.dataset_indices = []
+        for idx, kwargs in enumerate(dataset_kwargs):
+            dataset_name = kwargs["name"]
+            del kwargs["name"]
+
             dataset = SupervisedDataset(
                 **kwargs,
                 load_wdd_vectors=True,
@@ -789,12 +794,15 @@ class SupervisedValidationDatasetEvaluator:
             )
 
             datasets.append(dataset)
+            self.dataset_names.append(dataset_name)
+            self.dataset_indices.extend([idx] * len(dataset))
 
         if len(datasets) == 1:
             self.dataset = datasets[0]
         else:
             self.dataset = ChainDatasetWithKwargsForwarding(*datasets)
 
+        self.dataset_indices = np.array(self.dataset_indices, dtype=int)
         self.return_indices = return_indices
         self.class_labels = class_labels
         self.use_wandb = use_wandb
@@ -876,6 +884,18 @@ class SupervisedValidationDatasetEvaluator:
             )
         except ValueError as e:
             metrics["test_roc_auc_score"] = np.nan
+
+        for dataset_index in np.unique(self.dataset_indices):
+            dataset_name = self.dataset_names[dataset_index]
+            score_name = "{}_roc_auc_score".format(dataset_name)
+            idx = self.dataset_indices == dataset_index
+
+            try:
+                metrics[score_name] = sklearn.metrics.roc_auc_score(
+                    all_classes[idx], all_classes_hat[idx], multi_class="ovr"
+                )
+            except ValueError as e:
+                metrics[score_name] = np.nan
 
         metrics["test_matthews"] = sklearn.metrics.matthews_corrcoef(
             all_classes, all_classes_hat_argmax

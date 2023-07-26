@@ -75,7 +75,19 @@ def run(
         (s if (s is not None) else 1.0) for s in dataset_scale_factors
     ]
 
-    for gt_data_path, gt_scaling_factor in zip(gt_data_paths, dataset_scale_factors):
+    for dataset_index, (gt_data_path, gt_scaling_factor) in enumerate(
+        zip(gt_data_paths, dataset_scale_factors)
+    ):
+        suffix_indicator = ".pickle:"
+        dataset_name_index = gt_data_path.find(suffix_indicator)
+        dataset_name = "dataset{}".format(dataset_index)
+
+        if dataset_name_index != -1:
+            dataset_name = gt_data_path[(dataset_name_index + len(suffix_indicator)) :]
+            gt_data_path = gt_data_path[
+                : (dataset_name_index + len(suffix_indicator) - 1)
+            ]
+
         with open(gt_data_path, "rb") as f:
             wdd_gt_data = pickle.load(f)
             gt_data_df = [(key,) + v for key, v in wdd_gt_data.items()]
@@ -95,6 +107,7 @@ def run(
         )
 
         eval_dataset_kwargs = dict(
+            name=dataset_name,
             gt_paths=[gt_data_df[idx] for idx in test_indices],
             image_size=image_size,
             remap_paths_to=remap_wdd_dir,
@@ -193,7 +206,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--max-lr", type=float, default=0.002 * 8)
     parser.add_argument("--batch-size", default="auto")
-    parser.add_argument("--wandb-entity", type=str, default="d_d")
+    parser.add_argument("--wandb-entity", type=str, default="")
+    parser.add_argument("--wandb-project", type=str, default="wdd-image-classification")
     args = parser.parse_args()
 
     continue_training = args.continue_training
@@ -213,4 +227,5 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         max_lr=args.max_lr,
         wandb_entity=args.wandb_entity,
+        wandb_project=args.wandb_project,
     )
