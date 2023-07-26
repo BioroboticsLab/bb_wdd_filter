@@ -32,15 +32,14 @@ class Trainer:
         run_batch_fn=None,
     ):
         def init_worker(ID):
-
             import torch
             import numpy as np
 
-            np.random.seed(torch.initial_seed() % 2 ** 32)
+            np.random.seed(torch.initial_seed() % 2**32)
 
             import imgaug
 
-            imgaug.seed((torch.initial_seed() + 1) % 2 ** 32)
+            imgaug.seed((torch.initial_seed() + 1) % 2**32)
 
         self.dataset = dataset
         self.batch_sampler = BatchSampler(
@@ -67,7 +66,7 @@ class Trainer:
         self.use_wandb = use_wandb
         self.wandb_config = wandb_config
         if self.use_wandb is None:
-            self.use_wandb = len(wandb_config) > 0
+            self.use_wandb = wandb_config is not None and len(wandb_config) > 0
 
         if self.use_wandb:
             import wandb
@@ -105,7 +104,6 @@ class Trainer:
         return self.use_wandb
     
     def run_batch(self, images, vectors, durations=None, labels=None):
-
         current_state = dict()
 
         self.model.train()
@@ -201,7 +199,6 @@ class Trainer:
         return loss_info
 
     def run_epoch(self):
-
         if self.use_wandb:
             import wandb
 
@@ -213,7 +210,6 @@ class Trainer:
         )
 
         for _, batch in enumerate(tqdm.auto.tqdm(self.dataloader, leave=False)):
-
             self.check_scale_augmenters()
 
             loss_info = self.run_batch(*batch)
@@ -241,7 +237,6 @@ class Trainer:
 
     def run_epochs(self, n):
         for i in range(n):
-
             self.run_epoch()
             self.total_epochs += 1
 
@@ -250,7 +245,6 @@ class Trainer:
                 self.save_state(copy_suffix="_epoch{:03d}".format(self.total_epochs))
 
     def save_state(self, copy_suffix=None):
-
         model_state_dict = self.model.state_dict()
 
         state = dict(
