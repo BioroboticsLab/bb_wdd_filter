@@ -7,6 +7,7 @@ import torchvision.transforms.functional
 
 DEFAULT_CLASS_LABELS = ["other", "waggle", "ventilating", "activating"]
 
+
 class TensorView(torch.nn.Module):
     def __init__(self, *shape):
         self.shape = shape
@@ -24,7 +25,6 @@ class WDDClassificationModel(torch.nn.Module):
         scaledown_factor=4,
         inplace=False,
     ):
-
         super().__init__()
 
         center_stride = image_size // 32
@@ -102,8 +102,8 @@ class WDDClassificationModel(torch.nn.Module):
 
         self.seq = torch.nn.Sequential(*self.seq)
 
-    def postprocess_predictions(self, all_outputs, return_raw=False, as_numpy=False):
-        
+    @staticmethod
+    def postprocess_predictions(all_outputs, return_raw=False, as_numpy=False):
         n_classes = 4
 
         classes_hat = all_outputs[:, :n_classes]
@@ -118,7 +118,7 @@ class WDDClassificationModel(torch.nn.Module):
             confidences = probabilities[np.arange(probabilities.shape[0]), classes_hat]
             vectors_hat = torch.tanh(vectors_hat)
             durations_hat = torch.relu(durations_hat)
-        
+
         if as_numpy:
             classes_hat = classes_hat.detach().cpu().numpy()
             vectors_hat = vectors_hat.detach().cpu().numpy()
@@ -161,10 +161,7 @@ class WDDClassificationModel(torch.nn.Module):
 
 # To support DataParallel.
 class SupervisedModelTrainWrapper(torch.nn.Module):
-    def __init__(
-        self, model, class_labels=DEFAULT_CLASS_LABELS, use_wandb=True
-    ):
-
+    def __init__(self, model, class_labels=DEFAULT_CLASS_LABELS, use_wandb=True):
         super().__init__()
 
         self.vector_similarity = torch.nn.CosineSimilarity(dim=1)
@@ -174,10 +171,10 @@ class SupervisedModelTrainWrapper(torch.nn.Module):
         self.use_wandb = use_wandb
 
         self.model = model
-    
+
     def set_use_wandb(self, use_wandb=True):
         self.use_wandb = use_wandb
-        
+
     def forward(self, x):
         return self.model(x)
 
@@ -195,6 +192,7 @@ class SupervisedModelTrainWrapper(torch.nn.Module):
 
         if self.use_wandb:
             import wandb
+
             results["train_conf"] = wandb.plot.confusion_matrix(
                 probs=None,
                 y_true=labels,
@@ -240,7 +238,12 @@ class SupervisedModelTrainWrapper(torch.nn.Module):
         model = self.model
 
         all_outputs = model(images)
-        classes_hat, vectors_hat, durations_hat, _ = model.postprocess_predictions(all_outputs, return_raw=True)        
+        (
+            classes_hat,
+            vectors_hat,
+            durations_hat,
+            _,
+        ) = WDDClassificationModel.postprocess_predictions(all_outputs, return_raw=True)
 
         losses = dict()
 
