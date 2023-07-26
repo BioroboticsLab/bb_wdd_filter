@@ -1,5 +1,6 @@
 from locale import normalize
 import imgaug.augmenters as iaa
+import itertools
 import json
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,6 +18,7 @@ import torch.utils.data
 import tqdm.auto
 import zipfile
 import sklearn.preprocessing
+
 
 class ImageNormalizer:
     def __init__(self, image_size, scale_factor):
@@ -43,7 +45,6 @@ class ImageNormalizer:
         return images
 
     def floatify_image(self, img):
-
         if not np.issubdtype(img.dtype, np.floating):
             assert img.max() > 1
             img = img.astype(np.float32)
@@ -59,29 +60,27 @@ class ImageNormalizer:
 
     def normalize_images(self, images):
         return self.floatify_images(self.crop_images(images))
-        
 
-class WDDDataset:
+
+class WDDDataset(torch.utils.data.IterableDataset):
     def __init__(
         self,
         paths,
         temporal_dimension=15,
         n_targets=3,
         target_offset=2,
-        images_in_archives=True,
         remap_wdd_dir=None,
         image_size=128,
         silently_skip_invalid=True,
         load_wdd_vectors=False,
         load_wdd_durations=False,
         wdd_angles_for_samples=None,
-        default_image_scale=0.5,
+        default_image_scale=0.5,  # For inference.
+        forced_scale_factor=None,  # Even during training.
     ):
-
         self.load_wdd_vectors = load_wdd_vectors
         self.load_wdd_durations = load_wdd_durations
         self.silently_skip_invalid = silently_skip_invalid
-        self.images_in_archives = images_in_archives
         self.sample_gaps = False
         self.all_meta_files = []
         self.wdd_angles_for_samples = wdd_angles_for_samples
@@ -105,17 +104,34 @@ class WDDDataset:
 
         if remap_wdd_dir:
             for i, path in enumerate(self.all_meta_files):
-                path = str(path).replace("/mnt/thekla/", remap_wdd_dir)
-                path = pathlib.Path(path)
+                path = WDDDataset.try_remap_path(path, remap_wdd_dir)
                 self.all_meta_files[i] = path
+
+        self.images_in_archives = []
+        self.images_as_apngs = []
+        self.metadata_cache = dict()
+
+        for _, path in enumerate(self.all_meta_files):
+            folder = path.parent
+            as_apng = False
+            in_archive = False
+
+            if os.path.exists(folder / "frames.apng"):
+                as_apng = True
+            elif os.path.exists(folder / "images.zip"):
+                in_archive = True
+
+            self.images_in_archives.append(in_archive)
+            self.images_as_apngs.append(as_apng)
 
         self.temporal_dimension = temporal_dimension
         self.n_targets = n_targets
         self.target_offset = target_offset
+        self.forced_scale_factor = forced_scale_factor
 
-        self.default_normalizer = ImageNormalizer(image_size=image_size,
-                scale_factor=default_image_scale)
-        
+        self.default_normalizer = ImageNormalizer(
+            image_size=image_size, scale_factor=default_image_scale
+        )
 
     def load_and_normalize_image(self, filename):
         img = WDDDataset.load_image(filename)
@@ -124,6 +140,14 @@ class WDDDataset:
         img = self.default_normalizer.floatify_image(img)
 
         return img
+
+    @staticmethod
+    def try_remap_path(path, remap_wdd_dir):
+        path = str(path)
+        if "/wdd/" in path:
+            wdd_root, dataset_subdirectory = path.split("/wdd/")
+            path = os.path.join(remap_wdd_dir, dataset_subdirectory)
+        return pathlib.Path(path)
 
     @staticmethod
     def load_image(filename):
@@ -137,6 +161,17 @@ class WDDDataset:
         return [WDDDataset.load_image(os.path.join(parent, f)) for f in filenames]
 
     @staticmethod
+    def load_frame_from_apng(file, index):
+        file.seek(index)
+        img = np.asarray(file)
+        assert img.dtype is np.dtype(np.uint8)
+        return img
+
+    @staticmethod
+    def load_frames_from_apng(file, indices):
+        return [WDDDataset.load_frame_from_apng(file, i) for i in indices]
+
+    @staticmethod
     def load_images_from_archive(filenames, archive):
         images = []
         for fn in filenames:
@@ -145,21 +180,28 @@ class WDDDataset:
         return images
 
     @staticmethod
+    def load_waggle_metadata_json(waggle_metadata_path):
+        with open(waggle_metadata_path, "r") as f:
+            waggle_metadata = json.load(f)
+        return waggle_metadata
+
+    @staticmethod
     def load_metadata_for_waggle(
         waggle_metadata_path,
         temporal_dimension,
         load_images=True,
         images_in_archives=False,
+        images_as_apngs=False,
         gap_factor=1,
         n_targets=0,
         target_offset=1,
         return_center_images=False,
+        waggle_metadata=None,
     ):
-
         waggle_dir = waggle_metadata_path.parent
 
-        with open(waggle_metadata_path, "r") as f:
-            waggle_metadata = json.load(f)
+        if waggle_metadata is None:
+            waggle_metadata = WDDDataset.load_waggle_metadata_json(waggle_metadata_path)
 
         available_frames_length = len(waggle_metadata["frame_timestamps"])
         try:
@@ -187,7 +229,6 @@ class WDDDataset:
             assert available_frames_length >= target_sequence_length + sequence_length
 
         def select_images_from_list(images):
-
             if temporal_dimension is None:
                 if return_center_images:
                     n_available_images = len(images)
@@ -234,7 +275,23 @@ class WDDDataset:
                     ]
             return images + targets
 
-        if images_in_archives:
+        if images_as_apngs:
+            file_path = os.path.join(waggle_dir, "frames.apng")
+            if not os.path.exists(file_path):
+                print("{} does not exist.".format(file_path))
+                return None, None
+            try:
+                with PIL.Image.open(file_path) as sequence:
+                    image_indices = list(range(sequence.n_frames))
+                    images = select_images_from_list(image_indices)
+
+                    if load_images:
+                        images = WDDDataset.load_frames_from_apng(sequence, images)
+            except Exception as e:
+                print("APNG file failed to load: {}".format(str(e)))
+
+            pass
+        elif images_in_archives:
             zip_file_path = os.path.join(waggle_dir, "images.zip")
             if not os.path.exists(zip_file_path):
                 print("{} does not exist.".format(zip_file_path))
@@ -277,14 +334,25 @@ class WDDDataset:
         return_center_images=False,
     ):
         waggle_metadata_path = self.all_meta_files[i]
+        images_in_archives = self.images_in_archives[i]
+        images_as_apngs = self.images_as_apngs[i]
+
+        if waggle_metadata_path in self.metadata_cache:
+            waggle_metadata = self.metadata_cache[waggle_metadata_path]
+        else:
+            waggle_metadata = WDDDataset.load_waggle_metadata_json(waggle_metadata_path)
+
+            self.metadata_cache[waggle_metadata_path] = waggle_metadata
 
         images, waggle_angle, waggle_duration = WDDDataset.load_metadata_for_waggle(
             waggle_metadata_path,
             self.temporal_dimension,
-            images_in_archives=self.images_in_archives,
+            images_in_archives=images_in_archives,
+            images_as_apngs=images_as_apngs,
             n_targets=self.n_targets,
             target_offset=self.target_offset,
             return_center_images=return_center_images,
+            waggle_metadata=waggle_metadata,
         )
 
         if self.wdd_angles_for_samples is not None:
@@ -297,7 +365,15 @@ class WDDDataset:
                 return None, None, None
         if return_just_one:
             images = images[:1]
-        # images = WDDDataset.load_images(image_filenames, parent=waggle_metadata_path.parent)
+
+        if self.forced_scale_factor is not None and self.forced_scale_factor != 1.0:
+            images = [
+                skimage.transform.rescale(
+                    img, self.forced_scale_factor, preserve_range=True
+                ).astype(np.uint8)
+                for img in images
+            ]
+
         if aug is not None:
             images, waggle_angle = aug(images, waggle_angle)
         else:
@@ -343,7 +419,6 @@ class BatchSampler:
         self.image_size = image_size
 
     def init_augmenters(self, current_epoch=1, total_epochs=1):
-
         p = np.clip(
             0.1 + np.log1p(2 * current_epoch / (max(1, total_epochs - 1))), 0, 1
         )
@@ -409,7 +484,6 @@ class BatchSampler:
         return (self.total_length * self.inflate_dataset_factor) // self.batch_size
 
     def __getitem__(self, _):
-
         if self.augmenters is None:
             self.init_augmenters()
 
@@ -459,7 +533,6 @@ class BatchSampler:
 
     @classmethod
     def augment_sequence(self, aug, images, angle, rotate=True):
-
         rotation = np.random.randint(0, 360)
 
         for idx, img in enumerate(images):
@@ -481,7 +554,6 @@ class ValidationDatasetEvaluator:
         temporal_dimension=None,
         return_indices=False,
     ):
-
         if raw_paths is None:
             self.gt_data_df, paths = ValidationDatasetEvaluator.load_ground_truth_data(
                 gt_data_path, remap_paths_to=remap_paths_to
@@ -515,13 +587,7 @@ class ValidationDatasetEvaluator:
         paths = list(gt_data_df.path.values)
 
         if remap_paths_to:
-
-            def rewrite(p):
-                p = str(p).replace("/mnt/curta/storage/beesbook/wdd/", remap_paths_to)
-                p = pathlib.Path(p)
-                return p
-
-            paths = [rewrite(p) for p in paths]
+            paths = [WDDDataset.try_remap_path(p, remap_paths_to) for p in paths]
 
         return gt_data_df, paths
 
@@ -545,7 +611,6 @@ class ValidationDatasetEvaluator:
         get_sample_images=True,
         augment_images=False,
     ):
-
         augmentations = [None]
         if augment_images:
             augmentations = [
@@ -603,7 +668,6 @@ class ValidationDatasetEvaluator:
         return sample_images, embeddings, labels
 
     def plot_embeddings(self, sample_images, embeddings, labels, **kwargs):
-
         from bb_wdd_filter.visualization import plot_embeddings
 
         return plot_embeddings(
@@ -616,7 +680,6 @@ class ValidationDatasetEvaluator:
         )
 
     def calculate_scores(self, embeddings, labels):
-
         import sklearn.linear_model
         import sklearn.preprocessing
         import sklearn.dummy
@@ -659,7 +722,6 @@ class ValidationDatasetEvaluator:
         return scores
 
     def evaluate(self, model, embed_kwargs={}, plot_kwargs={}):
-
         images, embeddings, labels = self.get_images_and_embeddings(
             model, **embed_kwargs
         )
@@ -669,23 +731,20 @@ class ValidationDatasetEvaluator:
         return scores, plot
 
 
-class SupervisedDataset:
+class SupervisedDataset(torch.utils.data.IterableDataset):
     def __init__(
         self,
         gt_paths,
         image_size=32,
         temporal_dimension=40,
         remap_paths_to="/mnt/thekla/",
-        images_in_archives=False,
         **kwargs,
     ):
-
         self.gt_data_df, self.paths = ValidationDatasetEvaluator.load_ground_truth_data(
             gt_paths, remap_paths_to=remap_paths_to
         )
         self.dataset = WDDDataset(
             self.paths,
-            images_in_archives=images_in_archives,
             temporal_dimension=temporal_dimension,
             image_size=image_size,
             n_targets=0,
@@ -716,34 +775,34 @@ class SupervisedDataset:
 class SupervisedValidationDatasetEvaluator:
     def __init__(
         self,
-        gt_data_path,
-        remap_paths_to="/mnt/thekla/",
-        images_in_archives=False,
-        image_size=128,
-        temporal_dimension=None,
+        dataset_kwargs,
         return_indices=False,
-        default_image_scale=0.25,
-        class_labels=["other", "waggle", "ventilating", "activating"]
+        use_wandb=False,
+        class_labels=["other", "waggle", "ventilating", "activating"],
     ):
+        datasets = []
+        for kwargs in dataset_kwargs:
+            dataset = SupervisedDataset(
+                **kwargs,
+                load_wdd_vectors=True,
+                load_wdd_durations=True,
+            )
 
-        self.dataset = SupervisedDataset(
-            gt_data_path,
-            images_in_archives=images_in_archives,
-            image_size=image_size,
-            load_wdd_vectors=True,
-            load_wdd_durations=True,
-            remap_paths_to=remap_paths_to,
-            default_image_scale=default_image_scale,
-        )
+            datasets.append(dataset)
+
+        if len(datasets) == 1:
+            self.dataset = datasets[0]
+        else:
+            self.dataset = ChainDatasetWithKwargsForwarding(*datasets)
 
         self.return_indices = return_indices
         self.class_labels = class_labels
+        self.use_wandb = use_wandb
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, i):
-
         item = self.dataset.__getitem__(
             i, normalize_to_float=True, return_center_images=True
         )
@@ -753,7 +812,6 @@ class SupervisedValidationDatasetEvaluator:
         return item
 
     def evaluate(self, model, plot_kwargs=dict()):
-
         dataloader = torch.utils.data.DataLoader(
             self, num_workers=0, batch_size=16, shuffle=False, drop_last=False
         )
@@ -762,10 +820,12 @@ class SupervisedValidationDatasetEvaluator:
         all_vectors_hat = []
         all_durations_hat = []
         all_classes = self.dataset.Y
+        assert all_classes.shape[0] == len(self)
+
         all_vectors = []
         all_durations = []
 
-        for (images, vectors, durations, _) in dataloader:
+        for images, vectors, durations, _ in dataloader:
             predictions = model(images.cuda())
             assert predictions.shape[2] == 1
             assert predictions.shape[3] == 1
@@ -799,6 +859,13 @@ class SupervisedValidationDatasetEvaluator:
         all_vectors = np.concatenate(all_vectors, axis=0)
         all_durations = np.concatenate(all_durations, axis=0)
 
+        if all_classes_hat.shape[0] != all_classes.shape[0]:
+            raise ValueError(
+                "Dataset has inconsistent labels vs samples: {} labels and {} samples.".format(
+                    all_classes.shape[0], all_classes_hat.shape[0]
+                )
+            )
+
         metrics = dict()
         metrics["test_balanced_accuracy"] = sklearn.metrics.balanced_accuracy_score(
             all_classes, all_classes_hat_argmax, adjusted=True
@@ -809,7 +876,7 @@ class SupervisedValidationDatasetEvaluator:
             )
         except ValueError as e:
             metrics["test_roc_auc_score"] = np.nan
-            
+
         metrics["test_matthews"] = sklearn.metrics.matthews_corrcoef(
             all_classes, all_classes_hat_argmax
         )
@@ -829,10 +896,10 @@ class SupervisedValidationDatasetEvaluator:
             Y_hat = all_classes_hat_argmax == i
             Y = all_classes == i
 
-            metrics[f"test_precision_{label}"] = sklearn.metrics.precision_score(Y, Y_hat)
+            metrics[f"test_precision_{label}"] = sklearn.metrics.precision_score(
+                Y, Y_hat
+            )
             metrics[f"test_recall_{label}"] = sklearn.metrics.recall_score(Y, Y_hat)
-
-            
 
         idx = ~pandas.isnull(all_durations)
         all_durations = all_durations[idx]
@@ -841,7 +908,40 @@ class SupervisedValidationDatasetEvaluator:
             all_durations, all_durations_hat
         )
 
+        if self.use_wandb:
+            import wandb
+
+            metrics["test_conf"] = wandb.plot.confusion_matrix(
+                probs=None,
+                y_true=all_classes,
+                preds=all_classes_hat_argmax,
+                class_names=self.class_labels,
+            )
+
         return metrics
+
+
+class ChainDatasetWithKwargsForwarding:
+    def __init__(self, *args):
+        self.datasets = list(args)
+        self.lengths = [len(d) for d in self.datasets]
+        self.total_length = sum(self.lengths)
+
+        self.Y = np.concatenate(tuple(d.Y for d in self.datasets), axis=0)
+
+    def __len__(self):
+        return self.total_length
+
+    def __getitem__(self, i, *args, **kwargs):
+        if i < 0 or i >= self.total_length:
+            raise ValueError("Index out of range.")
+
+        for idx, l in enumerate(self.lengths):
+            if i < l:
+                return self.datasets[idx].__getitem__(i, *args, **kwargs)
+            else:
+                i -= l
+        assert False
 
 
 class WDDDatasetWithIndicesAndNormalized:

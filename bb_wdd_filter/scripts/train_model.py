@@ -12,30 +12,30 @@ import bb_wdd_filter.visualization
 
 
 def run(
-    gt_data_path,
+    gt_data_paths,
     checkpoint_path=None,
     continue_training=True,
     epochs=1000,
     remap_wdd_dir=None,
     image_size=32,
-    images_in_archives=True,
     multi_gpu=False,
     image_scale=0.5,
     batch_size="auto",
     max_lr=0.002 * 8,
     wandb_entity=None,
+    dataset_scale_factors=None,
     wandb_project="wdd-image-classification",
 ):
     """
     Arguments:
-        gt_data_path (string)
-            Path to the .pickle file containing the ground-truth labels and paths.
+        gt_data_paths (list(string))
+            Paths to the .pickle files containing the ground-truth labels and paths.
+        dataset_scale_factors (list(float))
+            Scaling factors in case of using multiple datasets with different resolutions.
+            Same length as gt_data_paths if given.
         remap_wdd_dir (string, optional)
             Prefix of the path where the image data is saved. The paths in gt_data_path
             will be changed to point to this directory instead.
-        images_in_archives (bool)
-            Whether the images of the single waggle frames are saved withing an images.zip
-            file in each WDD subdirectory.
         checkpoint_path (string, optional)
             Filename to which the model will be saved regularly during training.
             The model will be saved on every epoch AND every X batches.
@@ -61,33 +61,69 @@ def run(
 
     """
 
-    with open(gt_data_path, "rb") as f:
-        wdd_gt_data = pickle.load(f)
-        gt_data_df = [(key,) + v for key, v in wdd_gt_data.items()]
+    train_datasets = []
+    test_datasets = []
 
-    all_indices = np.arange(len(gt_data_df))
-    test_indices = all_indices[::10]
-    train_indices = [idx for idx in all_indices if not (idx in test_indices)]
+    if dataset_scale_factors is None:
+        dataset_scale_factors = [None] * len(gt_data_paths)
+    else:
+        if len(dataset_scale_factors) != len(gt_data_paths):
+            raise ValueError(
+                "Number of scaling factors need to be the same as number of datasets."
+            )
+    dataset_scale_factors = [
+        (s if (s is not None) else 1.0) for s in dataset_scale_factors
+    ]
 
-    print("Train set:")
-    dataset = bb_wdd_filter.dataset.SupervisedDataset(
-        [gt_data_df[idx] for idx in train_indices],
-        images_in_archives=images_in_archives,
-        image_size=image_size,
-        load_wdd_vectors=True,
-        load_wdd_durations=True,
-        remap_paths_to=remap_wdd_dir,
-    )
+    for gt_data_path, gt_scaling_factor in zip(gt_data_paths, dataset_scale_factors):
+        with open(gt_data_path, "rb") as f:
+            wdd_gt_data = pickle.load(f)
+            gt_data_df = [(key,) + v for key, v in wdd_gt_data.items()]
+
+        all_indices = np.arange(len(gt_data_df))
+        test_indices = all_indices[::10]
+        train_indices = [idx for idx in all_indices if not (idx in test_indices)]
+
+        print("Train set:")
+        dataset = bb_wdd_filter.dataset.SupervisedDataset(
+            [gt_data_df[idx] for idx in train_indices],
+            image_size=image_size,
+            load_wdd_vectors=True,
+            load_wdd_durations=True,
+            remap_paths_to=remap_wdd_dir,
+            forced_scale_factor=gt_scaling_factor,
+        )
+
+        eval_dataset_kwargs = dict(
+            gt_paths=[gt_data_df[idx] for idx in test_indices],
+            image_size=image_size,
+            remap_paths_to=remap_wdd_dir,
+            default_image_scale=gt_scaling_factor * image_scale,
+        )
+
+        train_datasets.append(dataset)
+        test_datasets.append(eval_dataset_kwargs)
+
+    if len(train_datasets) == 1:
+        dataset = train_datasets[0]
+    else:
+        dataset = bb_wdd_filter.dataset.ChainDatasetWithKwargsForwarding(
+            *train_datasets
+        )
+
+    wandb_config = None
+    use_wandb = False
+    if wandb_entity:
+        # Project name is fixed so far.
+        # This provides a logging interface to wandb.ai.
+        wandb_config = dict(project=wandb_project, entity=wandb_entity)
+        use_wandb = True
 
     print("Test set:")
     # The evaluator's job is to regularly evaluate the training progress on the test dataset.
     # It will calculate additional statistics that are logged over the wandb connection.
     evaluator = bb_wdd_filter.dataset.SupervisedValidationDatasetEvaluator(
-        [gt_data_df[idx] for idx in test_indices],
-        images_in_archives=images_in_archives,
-        image_size=image_size,
-        remap_paths_to=remap_wdd_dir,
-        default_image_scale=image_scale,
+        test_datasets, use_wandb=use_wandb
     )
 
     model = bb_wdd_filter.models_supervised.WDDClassificationModel(
@@ -116,12 +152,6 @@ def run(
         batch_size,
     )
 
-    wandb_config = None
-    if wandb_entity:
-        # Project name is fixed so far.
-        # This provides a logging interface to wandb.ai.
-        wandb_config = (dict(project=wandb_project, entity=wandb_entity),)
-
     trainer = bb_wdd_filter.trainer_supervised.SupervisedTrainer(
         dataset,
         model,
@@ -149,10 +179,9 @@ def run(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--index-path",
-        type=str,
-        default="./ground_truth_wdd_angles.pickle",
+        "--index-path", type=str, default="./ground_truth_wdd_angles.pickle", nargs="+"
     )
+    parser.add_argument("--dataset-scale-factor", type=float, default=[1.0], nargs="+")
     parser.add_argument(
         "--checkpoint-path",
         type=str,
@@ -160,11 +189,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--remap-wdd-dir", type=str, default="")
     parser.add_argument("--continue-training", action="store_true")
-    parser.add_argument("--images-in-archives", action="store_true")
     parser.add_argument("--multi-gpu", action="store_true")
     parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--batch-size", type=float, default=0.002 * 8)
-    parser.add_argument("--max-lr", default="auto")
+    parser.add_argument("--max-lr", type=float, default=0.002 * 8)
+    parser.add_argument("--batch-size", default="auto")
     parser.add_argument("--wandb-entity", type=str, default="d_d")
     args = parser.parse_args()
 
@@ -175,12 +203,12 @@ if __name__ == "__main__":
             continue_training = False
 
     run(
-        gt_data_path=args.index_path,
+        gt_data_paths=args.index_path,
         checkpoint_path=args.checkpoint_path,
         epochs=args.epochs,
         continue_training=continue_training,
+        dataset_scale_factors=args.dataset_scale_factor,
         remap_wdd_dir=args.remap_wdd_dir,
-        images_in_archives=args.images_in_archives,
         multi_gpu=args.multi_gpu,
         batch_size=args.batch_size,
         max_lr=args.max_lr,
