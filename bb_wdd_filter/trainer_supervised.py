@@ -14,7 +14,6 @@ from .models_supervised import SupervisedModelTrainWrapper
 
 class SupervisedTrainer(Trainer):
     def __init__(self, dataset, model, *args, batch_sampler_kwargs=dict(), **kwargs):
-
         model = SupervisedModelTrainWrapper(model)
 
         super().__init__(
@@ -31,7 +30,6 @@ class SupervisedTrainer(Trainer):
         model.set_use_wandb(self.is_using_wandb())
 
     def sample_and_save_embedding(self):
-
         self.model.eval()
 
         loss_info = dict()
