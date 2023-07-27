@@ -304,6 +304,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
         waggle_metadata_path,
         temporal_dimension,
         load_images=True,
+        images_in_cache=False,
         images_in_archives=False,
         images_as_apngs=False,
         gap_factor=1,
@@ -406,6 +407,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
 
         images = WDDDataset.load_images_from_disk(
             waggle_dir,
+            images_in_cache=images_in_cache,
             images_as_apngs=images_as_apngs,
             images_in_archives=images_in_archives,
             load_images=load_images,
@@ -440,6 +442,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
         images, waggle_angle, waggle_duration = WDDDataset.load_metadata_for_waggle(
             waggle_metadata_path,
             self.temporal_dimension,
+            images_in_cache=self.has_images_in_cache,
             images_in_archives=images_in_archives,
             images_as_apngs=images_as_apngs,
             n_targets=self.n_targets,
@@ -999,7 +1002,10 @@ class SupervisedValidationDatasetEvaluator:
             all_classes, all_classes_hat_argmax
         )
         metrics["test_f1_weighted"] = sklearn.metrics.f1_score(
-            all_classes, all_classes_hat_argmax, average="weighted"
+            all_classes,
+            all_classes_hat_argmax,
+            average="weighted",
+            zero_division=np.nan,
         )
 
         metrics["test_angle_cosine"] = 1.0 - np.mean(
@@ -1015,9 +1021,11 @@ class SupervisedValidationDatasetEvaluator:
             Y = all_classes == i
 
             metrics[f"test_precision_{label}"] = sklearn.metrics.precision_score(
-                Y, Y_hat
+                Y, Y_hat, zero_division=np.nan
             )
-            metrics[f"test_recall_{label}"] = sklearn.metrics.recall_score(Y, Y_hat)
+            metrics[f"test_recall_{label}"] = sklearn.metrics.recall_score(
+                Y, Y_hat, zero_division=np.nan
+            )
 
         idx = ~pandas.isnull(all_durations)
         all_durations = all_durations[idx]

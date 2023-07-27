@@ -219,7 +219,7 @@ class SupervisedModelTrainWrapper(torch.nn.Module):
         )
 
         results["train_f1_weighted"] = sklearn.metrics.f1_score(
-            labels, predicted_labels, average="weighted"
+            labels, predicted_labels, average="weighted", zero_division=np.nan
         )
 
         if vectors_hat is not None:
