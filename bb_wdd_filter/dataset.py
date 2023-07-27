@@ -76,6 +76,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
         load_wdd_vectors=False,
         load_wdd_durations=False,
         wdd_angles_for_samples=None,
+        create_cache_on_startup=False,
         default_image_scale=0.5,  # For inference.
         forced_scale_factor=None,  # Even during training.
     ):
@@ -85,6 +86,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
         self.sample_gaps = False
         self.all_meta_files = []
         self.wdd_angles_for_samples = wdd_angles_for_samples
+        self.has_images_in_cache = create_cache_on_startup
 
         # Count and index waggle information.
         if isinstance(paths, str):
@@ -124,6 +126,27 @@ class WDDDataset(torch.utils.data.IterableDataset):
 
             self.images_in_archives.append(in_archive)
             self.images_as_apngs.append(as_apng)
+
+            cache_filename = folder / "images.h5"
+            if create_cache_on_startup and not os.path.exists(cache_filename):
+                import h5py
+
+                all_images = WDDDataset.load_images_from_disk(
+                    folder,
+                    images_in_archives=in_archive,
+                    images_as_apngs=as_apng,
+                    forced_scale_factor=forced_scale_factor,
+                )
+
+                with h5py.File(cache_filename, "w") as h5f:
+                    any_image = all_images[0]
+                    ds = h5f.create_dataset(
+                        "images",
+                        shape=(len(all_images), any_image.shape[0], any_image.shape[1]),
+                        dtype=any_image.dtype,
+                    )
+                    for idx, img in enumerate(all_images):
+                        ds[idx, :, :] = img
 
         self.temporal_dimension = temporal_dimension
         self.n_targets = n_targets
@@ -189,13 +212,30 @@ class WDDDataset(torch.utils.data.IterableDataset):
     @staticmethod
     def load_images_from_disk(
         waggle_dir,
+        images_in_cache=False,
         images_in_archives=False,
         images_as_apngs=False,
         load_images=True,
         filter_fn=lambda x: x,
-        forced_scale_factor=None
+        forced_scale_factor=None,
     ):
-        if images_as_apngs:
+        if images_in_cache:
+            import h5py
+
+            file_path = os.path.join(waggle_dir, "images.h5")
+            if not os.path.exists(file_path):
+                print("{} does not exist.".format(file_path))
+                return None, None
+
+            with h5py.File(file_path, "r") as h5f:
+                ds = h5f["images"]
+                image_indices = list(range(ds.shape[0]))
+                images = filter_fn(image_indices)
+
+                if load_images:
+                    images = [ds[idx] for idx in images]
+
+        elif images_as_apngs:
             file_path = os.path.join(waggle_dir, "frames.apng")
             if not os.path.exists(file_path):
                 print("{} does not exist.".format(file_path))
@@ -240,7 +280,11 @@ class WDDDataset(torch.utils.data.IterableDataset):
             if load_images:
                 images = WDDDataset.load_images(images, waggle_dir)
 
-        if load_images and forced_scale_factor is not None and forced_scale_factor != 1.0:
+        if (
+            load_images
+            and forced_scale_factor is not None
+            and forced_scale_factor != 1.0
+        ):
             images = [
                 cv2.resize(
                     img,
@@ -386,7 +430,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
             target_offset=self.target_offset,
             return_center_images=return_center_images,
             waggle_metadata=waggle_metadata,
-            forced_scale_factor=self.forced_scale_factor
+            forced_scale_factor=self.forced_scale_factor,
         )
 
         if self.wdd_angles_for_samples is not None:

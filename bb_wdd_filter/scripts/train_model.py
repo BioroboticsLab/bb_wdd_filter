@@ -15,6 +15,7 @@ def run(
     gt_data_paths,
     checkpoint_path=None,
     continue_training=True,
+    cache_images=False,
     epochs=1000,
     remap_wdd_dir=None,
     image_size=32,
@@ -42,6 +43,8 @@ def run(
         continue_training (bool)
             Whether to try to continue training from last checkpoint. Will use the same
             wandb run ID. Auto set to "false" in case no checkpoint is found.
+        cache_images (bool)
+            Whether to create H5 files that contain the uncompressed images. Needs write access to the dataset location.
         epochs (int)
             Number of epochs to train for.
             As the model is saved after every epoch in 'checkpoint_path' and as the logs are
@@ -104,6 +107,7 @@ def run(
             load_wdd_durations=True,
             remap_paths_to=remap_wdd_dir,
             forced_scale_factor=gt_scaling_factor,
+            create_cache_on_startup=cache_images,
         )
 
         eval_dataset_kwargs = dict(
@@ -112,6 +116,7 @@ def run(
             image_size=image_size,
             remap_paths_to=remap_wdd_dir,
             default_image_scale=gt_scaling_factor * image_scale,
+            create_cache_on_startup=cache_images,
         )
 
         train_datasets.append(dataset)
@@ -208,6 +213,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", default="auto")
     parser.add_argument("--wandb-entity", type=str, default="")
     parser.add_argument("--wandb-project", type=str, default="wdd-image-classification")
+    parser.add_argument("--cache-images", action="store_true")
     args = parser.parse_args()
 
     continue_training = args.continue_training
@@ -221,6 +227,7 @@ if __name__ == "__main__":
         checkpoint_path=args.checkpoint_path,
         epochs=args.epochs,
         continue_training=continue_training,
+        cache_images=args.cache_images,
         dataset_scale_factors=args.dataset_scale_factor,
         remap_wdd_dir=args.remap_wdd_dir,
         multi_gpu=args.multi_gpu,
