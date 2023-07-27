@@ -108,6 +108,7 @@ def run(
             remap_paths_to=remap_wdd_dir,
             forced_scale_factor=gt_scaling_factor,
             create_cache_on_startup=cache_images,
+            temporal_subsampling_probability=0.2,
         )
 
         eval_dataset_kwargs = dict(

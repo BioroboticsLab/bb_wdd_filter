@@ -72,6 +72,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
         target_offset=2,
         remap_wdd_dir=None,
         image_size=128,
+        temporal_subsampling_probability=None,
         silently_skip_invalid=True,
         load_wdd_vectors=False,
         load_wdd_durations=False,
@@ -87,6 +88,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
         self.all_meta_files = []
         self.wdd_angles_for_samples = wdd_angles_for_samples
         self.has_images_in_cache = create_cache_on_startup
+        self.temporal_subsampling_probability = temporal_subsampling_probability
 
         # Count and index waggle information.
         if isinstance(paths, str):
@@ -309,6 +311,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
         target_offset=1,
         return_center_images=False,
         forced_scale_factor=None,
+        temporal_subsampling_probability=None,
         waggle_metadata=None,
     ):
         waggle_dir = waggle_metadata_path.parent
@@ -317,6 +320,8 @@ class WDDDataset(torch.utils.data.IterableDataset):
             waggle_metadata = WDDDataset.load_waggle_metadata_json(waggle_metadata_path)
 
         available_frames_length = len(waggle_metadata["frame_timestamps"])
+        do_subsample_temporally = False
+
         try:
             waggle_angle = waggle_metadata["waggle_angle"]
             assert np.abs(waggle_angle) < np.pi * 2.0
@@ -331,6 +336,14 @@ class WDDDataset(torch.utils.data.IterableDataset):
                 gap_factor * temporal_dimension + target_sequence_length
             )
 
+            do_subsample_temporally = (
+                temporal_subsampling_probability
+                and available_frames_length >= 2 * sequence_length
+                and (np.random.uniform(0, 1) < temporal_subsampling_probability)
+            )
+            if do_subsample_temporally:
+                available_frames_length = (available_frames_length + 1) // 2
+
             if not return_center_images:
                 sequence_start = np.random.randint(
                     0, available_frames_length - sequence_length
@@ -342,6 +355,9 @@ class WDDDataset(torch.utils.data.IterableDataset):
             assert available_frames_length >= target_sequence_length + sequence_length
 
         def select_images_from_list(images):
+            if do_subsample_temporally:
+                images = images[::2]
+
             if temporal_dimension is None:
                 if return_center_images:
                     n_available_images = len(images)
@@ -431,6 +447,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
             return_center_images=return_center_images,
             waggle_metadata=waggle_metadata,
             forced_scale_factor=self.forced_scale_factor,
+            temporal_subsampling_probability=self.temporal_subsampling_probability,
         )
 
         if self.wdd_angles_for_samples is not None:
