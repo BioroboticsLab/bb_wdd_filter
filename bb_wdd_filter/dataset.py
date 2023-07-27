@@ -1,4 +1,5 @@
 from locale import normalize
+import cv2
 import imgaug.augmenters as iaa
 import itertools
 import json
@@ -368,9 +369,12 @@ class WDDDataset(torch.utils.data.IterableDataset):
 
         if self.forced_scale_factor is not None and self.forced_scale_factor != 1.0:
             images = [
-                skimage.transform.rescale(
-                    img, self.forced_scale_factor, preserve_range=True
-                ).astype(np.uint8)
+                cv2.resize(
+                    img,
+                    dsize=None,
+                    fx=self.forced_scale_factor,
+                    fy=self.forced_scale_factor,
+                )
                 for img in images
             ]
 
@@ -535,9 +539,20 @@ class BatchSampler:
     def augment_sequence(self, aug, images, angle, rotate=True):
         rotation = np.random.randint(0, 360)
 
+        rotation_matrix = None
+        rot_h, rot_w = None, None
         for idx, img in enumerate(images):
             if rotate:
-                img = skimage.transform.rotate(img, rotation)
+                h, w = img.shape[:2]
+
+                if rotation_matrix is None or (rot_h != h) or (rot_w != w):
+                    rot_h, rot_w = h, w
+                    center_x, center_y = rot_w // 2, rot_h // 2
+                    rotation_matrix = cv2.getRotationMatrix2D(
+                        (center_x, center_y), 45, 1.0
+                    )
+
+                img = cv2.warpAffine(img, rotation_matrix, (rot_w, rot_h))
             images[idx] = aug.augment_image(img)
 
         return images, angle + rotation / 180.0 * np.pi
