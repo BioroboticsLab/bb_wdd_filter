@@ -187,6 +187,73 @@ class WDDDataset(torch.utils.data.IterableDataset):
         return waggle_metadata
 
     @staticmethod
+    def load_images_from_disk(
+        waggle_dir,
+        images_in_archives=False,
+        images_as_apngs=False,
+        load_images=True,
+        filter_fn=lambda x: x,
+        forced_scale_factor=None
+    ):
+        if images_as_apngs:
+            file_path = os.path.join(waggle_dir, "frames.apng")
+            if not os.path.exists(file_path):
+                print("{} does not exist.".format(file_path))
+                return None, None
+            try:
+                with PIL.Image.open(file_path) as sequence:
+                    image_indices = list(range(sequence.n_frames))
+                    images = filter_fn(image_indices)
+
+                    if load_images:
+                        images = WDDDataset.load_frames_from_apng(sequence, images)
+            except Exception as e:
+                print("APNG file failed to load: {}".format(str(e)))
+
+            pass
+        elif images_in_archives:
+            zip_file_path = os.path.join(waggle_dir, "images.zip")
+            if not os.path.exists(zip_file_path):
+                print("{} does not exist.".format(zip_file_path))
+                return None, None
+
+            try:
+                with zipfile.ZipFile(zip_file_path, "r") as zf:
+                    images = list(sorted(zf.namelist()))
+                    images = filter_fn(images)
+
+                    if load_images:
+                        images = WDDDataset.load_images_from_archive(images, zf)
+            except zipfile.BadZipFile:
+                print("ZipFile corrupt: {}".format(zip_file_path))
+                return None, None
+
+        else:
+            images = list(
+                sorted([f for f in os.listdir(waggle_dir) if f.endswith("png")])
+            )
+            if len(images) == 0:
+                print("No images found in folder {}.".format(waggle_dir))
+            assert len(images) > 0
+
+            images = filter_fn(images)
+            if load_images:
+                images = WDDDataset.load_images(images, waggle_dir)
+
+        if load_images and forced_scale_factor is not None and forced_scale_factor != 1.0:
+            images = [
+                cv2.resize(
+                    img,
+                    dsize=None,
+                    fx=forced_scale_factor,
+                    fy=forced_scale_factor,
+                )
+                for img in images
+            ]
+
+        return images
+
+    @staticmethod
     def load_metadata_for_waggle(
         waggle_metadata_path,
         temporal_dimension,
@@ -197,6 +264,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
         n_targets=0,
         target_offset=1,
         return_center_images=False,
+        forced_scale_factor=None,
         waggle_metadata=None,
     ):
         waggle_dir = waggle_metadata_path.parent
@@ -276,50 +344,14 @@ class WDDDataset(torch.utils.data.IterableDataset):
                     ]
             return images + targets
 
-        if images_as_apngs:
-            file_path = os.path.join(waggle_dir, "frames.apng")
-            if not os.path.exists(file_path):
-                print("{} does not exist.".format(file_path))
-                return None, None
-            try:
-                with PIL.Image.open(file_path) as sequence:
-                    image_indices = list(range(sequence.n_frames))
-                    images = select_images_from_list(image_indices)
-
-                    if load_images:
-                        images = WDDDataset.load_frames_from_apng(sequence, images)
-            except Exception as e:
-                print("APNG file failed to load: {}".format(str(e)))
-
-            pass
-        elif images_in_archives:
-            zip_file_path = os.path.join(waggle_dir, "images.zip")
-            if not os.path.exists(zip_file_path):
-                print("{} does not exist.".format(zip_file_path))
-                return None, None
-
-            try:
-                with zipfile.ZipFile(zip_file_path, "r") as zf:
-                    images = list(sorted(zf.namelist()))
-                    images = select_images_from_list(images)
-
-                    if load_images:
-                        images = WDDDataset.load_images_from_archive(images, zf)
-            except zipfile.BadZipFile:
-                print("ZipFile corrupt: {}".format(zip_file_path))
-                return None, None
-
-        else:
-            images = list(
-                sorted([f for f in os.listdir(waggle_dir) if f.endswith("png")])
-            )
-            if len(images) == 0:
-                print("No images found in folder {}.".format(waggle_dir))
-            assert len(images) > 0
-
-            images = select_images_from_list(images)
-            if load_images:
-                images = WDDDataset.load_images(images, waggle_dir)
+        images = WDDDataset.load_images_from_disk(
+            waggle_dir,
+            images_as_apngs=images_as_apngs,
+            images_in_archives=images_in_archives,
+            load_images=load_images,
+            forced_scale_factor=forced_scale_factor,
+            filter_fn=select_images_from_list,
+        )
 
         return images, waggle_angle, waggle_duration
 
@@ -354,6 +386,7 @@ class WDDDataset(torch.utils.data.IterableDataset):
             target_offset=self.target_offset,
             return_center_images=return_center_images,
             waggle_metadata=waggle_metadata,
+            forced_scale_factor=self.forced_scale_factor
         )
 
         if self.wdd_angles_for_samples is not None:
@@ -366,17 +399,6 @@ class WDDDataset(torch.utils.data.IterableDataset):
                 return None, None, None
         if return_just_one:
             images = images[:1]
-
-        if self.forced_scale_factor is not None and self.forced_scale_factor != 1.0:
-            images = [
-                cv2.resize(
-                    img,
-                    dsize=None,
-                    fx=self.forced_scale_factor,
-                    fy=self.forced_scale_factor,
-                )
-                for img in images
-            ]
 
         if aug is not None:
             images, waggle_angle = aug(images, waggle_angle)
