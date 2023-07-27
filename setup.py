@@ -19,7 +19,7 @@ reqs += [url.split("egg=")[-1] for url in dep_links if "egg=" in url]
 
 setup(
     name="bb_wdd_filter",
-    version="0.1",
+    version="0.2",
     description="BeesBook WDD post-processing filter.",
     author="David Dormagen",
     author_email="david.dormagen@fu-berlin.de",
