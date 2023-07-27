@@ -102,7 +102,7 @@ class Trainer:
 
     def is_using_wandb(self):
         return self.use_wandb
-    
+
     def run_batch(self, images, vectors, durations=None, labels=None):
         current_state = dict()
 
@@ -233,6 +233,8 @@ class Trainer:
 
             if self.use_wandb:
                 loss_info["learning_rate"] = scheduler._last_lr
+                loss_info["epoch"] = self.total_epochs
+                loss_info["batches"] = self.total_batches
                 wandb.log(loss_info)
 
     def run_epochs(self, n):
