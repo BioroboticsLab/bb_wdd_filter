@@ -675,16 +675,24 @@ class ValidationDatasetEvaluator:
 
     @staticmethod
     def load_ground_truth_data(gt_data_path, remap_paths_to=""):
+
+        gt_data_is_dataframe = False
         if isinstance(gt_data_path, str):
-            with open(gt_data_path, "rb") as f:
-                wdd_gt_data = pickle.load(f)
-                gt_data_df = [(key,) + v for key, v in wdd_gt_data.items()]
+            if gt_data_path.endswith(".csv"):
+                gt_data_df = pandas.load_csv(gt_data_path)
+                gt_data_df.columns = ["waggle_id", "label", "gt_angle", "path"]
+                gt_data_is_dataframe = True
+            else: # Expect a pickle file.
+                with open(gt_data_path, "rb") as f:
+                    wdd_gt_data = pickle.load(f)
+                    gt_data_df = [(key,) + v for key, v in wdd_gt_data.items()]
         else:
             gt_data_df = gt_data_path
 
-        gt_data_df = pandas.DataFrame(
-            gt_data_df, columns=["waggle_id", "label", "gt_angle", "path"]
-        )
+        if not gt_data_is_dataframe:
+            gt_data_df = pandas.DataFrame(
+                gt_data_df, columns=["waggle_id", "label", "gt_angle", "path"]
+            )
         paths = list(gt_data_df.path.values)
 
         if remap_paths_to:
