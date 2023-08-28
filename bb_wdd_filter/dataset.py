@@ -370,8 +370,8 @@ class WDDDataset(torch.utils.data.IterableDataset):
 
             if len(images) != available_frames_length:
                 print(
-                    "N images: {}, available_frames_length: {}".format(
-                        len(images), available_frames_length
+                    "N images: {}, available_frames_length: {}, path: {}".format(
+                        len(images), available_frames_length, waggle_metadata_path
                     )
                 )
 
@@ -635,7 +635,7 @@ class BatchSampler:
                     rot_h, rot_w = h, w
                     center_x, center_y = rot_w // 2, rot_h // 2
                     rotation_matrix = cv2.getRotationMatrix2D(
-                        (center_x, center_y), 45, 1.0
+                        (center_x, center_y), rotation, 1.0
                     )
 
                 img = cv2.warpAffine(img, rotation_matrix, (rot_w, rot_h))
@@ -877,6 +877,7 @@ class SupervisedValidationDatasetEvaluator:
     def __init__(
         self,
         dataset_kwargs,
+        single_dataset=None,
         return_indices=False,
         use_wandb=False,
         class_labels=["other", "waggle", "ventilating", "activating"],
@@ -884,19 +885,25 @@ class SupervisedValidationDatasetEvaluator:
         datasets = []
         self.dataset_names = []
         self.dataset_indices = []
-        for idx, kwargs in enumerate(dataset_kwargs):
-            dataset_name = kwargs["name"]
-            del kwargs["name"]
 
-            dataset = SupervisedDataset(
-                **kwargs,
-                load_wdd_vectors=True,
-                load_wdd_durations=True,
-            )
+        if single_dataset is None:
+            for idx, kwargs in enumerate(dataset_kwargs):
+                dataset_name = kwargs["name"]
+                del kwargs["name"]
 
-            datasets.append(dataset)
-            self.dataset_names.append(dataset_name)
-            self.dataset_indices.extend([idx] * len(dataset))
+                dataset = SupervisedDataset(
+                    **kwargs,
+                    load_wdd_vectors=True,
+                    load_wdd_durations=True,
+                )
+
+                datasets.append(dataset)
+                self.dataset_names.append(dataset_name)
+                self.dataset_indices.extend([idx] * len(dataset))
+        else:
+            datasets = [single_dataset]
+            self.dataset_names = ["ds01"]
+            self.dataset_indices.extend([0] * len(single_dataset))
 
         if len(datasets) == 1:
             self.dataset = datasets[0]
@@ -935,13 +942,14 @@ class SupervisedValidationDatasetEvaluator:
         all_durations = []
 
         for images, vectors, durations, _ in dataloader:
-            predictions = model(images.cuda())
-            assert predictions.shape[2] == 1
-            assert predictions.shape[3] == 1
-            assert predictions.shape[4] == 1
-            predictions = predictions[:, :, 0, 0, 0]
-
             n_classes = 4
+            n_outputs = n_classes + 3  # vector x, vector y, duration
+
+            predictions = model(images.cuda())
+            predictions = predictions.squeeze()
+            assert predictions.shape[0] == images.shape[0]
+            assert predictions.shape[1] == n_outputs
+
             classes_hat = predictions[:, :n_classes]
             vectors_hat = predictions[:, n_classes : (n_classes + 2)]
             durations_hat = predictions[:, (n_classes + 2) : (n_classes + 3)]
@@ -1042,6 +1050,12 @@ class SupervisedValidationDatasetEvaluator:
                 y_true=all_classes,
                 preds=all_classes_hat_argmax,
                 class_names=self.class_labels,
+            )
+        else:
+            metrics["test_confusion_matrix"] = sklearn.metrics.confusion_matrix(
+                y_true=all_classes,
+                y_pred=all_classes_hat_argmax,
+                labels=np.arange(len(self.class_labels)),
             )
 
         return metrics
