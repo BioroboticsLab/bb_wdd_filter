@@ -24,6 +24,7 @@ def run(
     batch_size="auto",
     max_lr=0.002 * 8,
     wandb_entity=None,
+    num_workers=8,
     dataset_scale_factors=None,
     wandb_project="wdd-image-classification",
 ):
@@ -54,6 +55,8 @@ def run(
         image_scale (float)
             Scale factor for the data. E.g. 0.5 will scale the images to half resolution.
             That allows for a wider FoV for the model by sacrificing some resolution.
+        num_workers (int)
+            Number of threads to load the data.
         max_lr (float)
             The training uses a learning rate scheduler (OneCycleLR) for each epoch
             where max_lr constitutes the peak learning rate.
@@ -177,7 +180,7 @@ def run(
         wandb_config=wandb_config,
         save_path=checkpoint_path,
         batch_size=batch_size,
-        num_workers=8,
+        num_workers=num_workers,
         continue_training=continue_training,
         image_size=image_size,
         batch_sampler_kwargs=dict(
@@ -215,6 +218,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-entity", type=str, default="")
     parser.add_argument("--wandb-project", type=str, default="wdd-image-classification")
     parser.add_argument("--cache-images", action="store_true")
+    parser.add_argument("--num-workers", type=int, default=8)
     args = parser.parse_args()
 
     continue_training = args.continue_training
@@ -236,4 +240,5 @@ if __name__ == "__main__":
         max_lr=args.max_lr,
         wandb_entity=args.wandb_entity,
         wandb_project=args.wandb_project,
+        num_workers=args.num_workers,
     )
